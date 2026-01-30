@@ -586,6 +586,38 @@ Analyze each player crop now:"""
                 return info.jersey_number
         return None
 
+    def get_best_jersey_number(self, track_id: int) -> Optional[int]:
+        """
+        Get best guess jersey number for a track ID (confirmed or pending).
+
+        Returns the most likely jersey number even if not yet confirmed,
+        useful for visualization during processing.
+        """
+        from collections import Counter
+
+        # Check manual corrections first (highest priority)
+        if track_id in self.manual_corrections:
+            return self.manual_corrections[track_id]
+
+        # Check confirmed detections
+        if track_id in self.confirmed_players:
+            info = self.confirmed_players[track_id]
+            if info.jersey_number is not None:
+                return info.jersey_number
+
+        # Check pending observations - return most common observation
+        if track_id in self.pending_observations:
+            observations = self.pending_observations[track_id]
+            if observations:
+                # Return the number with highest confidence/most observations
+                numbers = [obs.jersey_number for obs in observations if obs.jersey_number]
+                if numbers:
+                    most_common = Counter(numbers).most_common(1)
+                    if most_common:
+                        return most_common[0][0]
+
+        return None
+
     def get_player_by_number(self, jersey_number: int, team: TeamSide) -> Optional[int]:
         """Get track ID for a jersey number and team."""
         return self.number_to_track.get((jersey_number, team))

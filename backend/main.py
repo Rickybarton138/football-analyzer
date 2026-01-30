@@ -5947,6 +5947,36 @@ async def get_player_trail(
     )
 
 
+@app.get("/api/visualization/player-tracking/{team}/{jersey_number}")
+async def get_player_continuous_tracking(team: str, jersey_number: int):
+    """
+    Get continuous tracking data for a specific player.
+
+    Tracks key positions like:
+    - #1: Goalkeeper
+    - #2: Right Back
+    - #3: Left Back
+    - #4/#5: Center Backs
+    - #6: Defensive Midfielder
+    - #7: Right Winger
+    - #8: Central Midfielder
+    - #9: Striker
+    - #10: Attacking Midfielder
+    - #11: Left Winger
+
+    Args:
+        team: 'home' or 'away'
+        jersey_number: Player's jersey number (1-11 typically)
+
+    Returns:
+        Player info, position history, distance covered, average position
+    """
+    if team not in ["home", "away"]:
+        raise HTTPException(status_code=400, detail="Team must be 'home' or 'away'")
+
+    return pitch_visualization_service.get_player_continuous_tracking(team, jersey_number)
+
+
 @app.get("/api/visualization/team-shape/{team}")
 async def get_team_shape(team: str, frame_number: int):
     """
@@ -6013,6 +6043,169 @@ async def get_player_distance(
 async def export_visualization_data():
     """Export all visualization data for frontend rendering."""
     return pitch_visualization_service.export_visualization_data()
+
+
+@app.get("/api/visualization/formation-analysis/{team}")
+async def analyze_team_formation(team: str):
+    """
+    Use GPT to analyze team formation based on player positions.
+
+    Analyzes average positions of all tracked players and identifies:
+    - Formation (e.g., 4-4-2, 4-3-3, 3-5-2)
+    - Player roles based on position
+    - Tactical shape assessment
+
+    Args:
+        team: 'home' or 'away'
+
+    Returns:
+        Formation analysis with player roles
+    """
+    if team not in ["home", "away"]:
+        raise HTTPException(status_code=400, detail="Team must be 'home' or 'away'")
+
+    # Get average positions for all players
+    avg_positions = pitch_visualization_service.get_average_positions(team)
+
+    if not avg_positions:
+        return {
+            "team": team,
+            "formation": "Unknown",
+            "analysis": "No player position data available",
+            "players": []
+        }
+
+    # If OpenAI API key is available, use GPT for analysis
+    if settings.OPENAI_API_KEY:
+        try:
+            import openai
+            client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+
+            # Prepare position data for GPT
+            position_data = "\n".join([
+                f"#{p['jersey_number']}: x={p['x']:.1f}, y={p['y']:.1f} (samples: {p.get('samples', 0)})"
+                for p in avg_positions
+            ])
+
+            prompt = f"""Analyze this football team's formation based on average player positions.
+Coordinates: x=0 is own goal, x=100 is opponent goal. y=0 is left touchline, y=100 is right touchline.
+
+Player positions ({team} team):
+{position_data}
+
+Based on these positions, provide:
+1. The most likely formation (e.g., 4-4-2, 4-3-3, 3-5-2, etc.)
+2. Each player's role based on their position and jersey number
+3. Brief tactical assessment of the team shape
+
+Format your response as JSON:
+{{
+    "formation": "X-X-X",
+    "confidence": 0.0-1.0,
+    "players": [
+        {{"jersey_number": N, "role": "Position Name", "zone": "defensive/midfield/attacking"}}
+    ],
+    "tactical_notes": "Brief analysis..."
+}}"""
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=800
+            )
+
+            # Parse GPT response
+            import json
+            try:
+                gpt_analysis = json.loads(response.choices[0].message.content)
+            except json.JSONDecodeError:
+                # If JSON parsing fails, return raw text
+                gpt_analysis = {
+                    "formation": "Analysis failed",
+                    "raw_response": response.choices[0].message.content
+                }
+
+            return {
+                "team": team,
+                "analysis_source": "gpt-4o-mini",
+                **gpt_analysis,
+                "raw_positions": avg_positions
+            }
+
+        except Exception as e:
+            # Fall back to rule-based analysis
+            pass
+
+    # Rule-based formation detection (fallback)
+    players_by_zone = {"defense": [], "midfield": [], "attack": []}
+
+    for p in avg_positions:
+        x = p["x"]
+        jersey = p["jersey_number"]
+
+        # Skip goalkeeper (usually x < 20)
+        if x < 20:
+            continue
+
+        if x < 40:
+            players_by_zone["defense"].append(jersey)
+        elif x < 70:
+            players_by_zone["midfield"].append(jersey)
+        else:
+            players_by_zone["attack"].append(jersey)
+
+    d = len(players_by_zone["defense"])
+    m = len(players_by_zone["midfield"])
+    a = len(players_by_zone["attack"])
+
+    formation = f"{d}-{m}-{a}" if d + m + a > 0 else "Unknown"
+
+    return {
+        "team": team,
+        "analysis_source": "rule-based",
+        "formation": formation,
+        "players_by_zone": players_by_zone,
+        "raw_positions": avg_positions,
+        "tactical_notes": f"Detected {d} defenders, {m} midfielders, {a} attackers based on average positions."
+    }
+
+
+@app.get("/api/visualization/all-players-tracking/{team}")
+async def get_all_players_tracking(team: str):
+    """
+    Get continuous tracking for all players on a team.
+
+    Returns tracking data for all detected players with:
+    - Jersey number
+    - Position name
+    - Average position
+    - Movement history
+    - Distance covered
+
+    Args:
+        team: 'home' or 'away'
+    """
+    if team not in ["home", "away"]:
+        raise HTTPException(status_code=400, detail="Team must be 'home' or 'away'")
+
+    # Get all tracked jersey numbers for this team
+    tracked_jerseys = set()
+    for (t, jersey) in pitch_visualization_service.tracked_positions.keys():
+        if t == team:
+            tracked_jerseys.add(jersey)
+
+    players = []
+    for jersey in sorted(tracked_jerseys):
+        tracking = pitch_visualization_service.get_player_continuous_tracking(team, jersey)
+        players.append(tracking)
+
+    return {
+        "team": team,
+        "players_tracked": len(players),
+        "goalkeeper": pitch_visualization_service.goalkeepers.get(team),
+        "players": players
+    }
 
 
 # ============== Auto Event Detection ==============

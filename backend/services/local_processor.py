@@ -786,18 +786,26 @@ class LocalVideoProcessor:
                         "away" if det_player.team == TeamSide.AWAY else "unknown"
                     )
                     if team_str in ["home", "away"]:
-                        jersey = det_player.jersey_number if det_player.jersey_number else det_player.track_id
+                        # Get best jersey number (confirmed, pending, or detected)
+                        # This allows visualization even during early processing
+                        jersey = det_player.jersey_number
+                        if jersey is None:
+                            # Try AI detection service - use best guess (confirmed or pending)
+                            jersey = ai_jersey_detection_service.get_best_jersey_number(det_player.track_id)
 
-                        # Record player position for pitch visualization
-                        pitch_visualization_service.record_player_position(
-                            team=team_str,
-                            jersey_number=jersey,
-                            x=pitch_x,
-                            y=pitch_y,
-                            frame_number=frame_count,
-                            timestamp_ms=timestamp_ms,
-                            has_ball=(det_player.track_id == ball_possessed_by)
-                        )
+                        # Only record if we have a valid jersey number (1-99)
+                        # This prevents random track_ids from polluting the visualization
+                        if jersey is not None and 1 <= jersey <= 99:
+                            # Record player position for pitch visualization
+                            pitch_visualization_service.record_player_position(
+                                team=team_str,
+                                jersey_number=jersey,
+                                x=pitch_x,
+                                y=pitch_y,
+                                frame_number=frame_count,
+                                timestamp_ms=timestamp_ms,
+                                has_ball=(det_player.track_id == ball_possessed_by)
+                            )
 
                         # Record possession data for match statistics
                         if det_player.track_id == ball_possessed_by:

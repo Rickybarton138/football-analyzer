@@ -76,6 +76,32 @@ class PitchVisualizationService:
         self.current_frame: int = 0
         self.current_timestamp_ms: int = 0
 
+        # Goalkeeper tracking - identified by position near goal or jersey #1
+        self.goalkeepers: Dict[str, int] = {}  # team -> jersey_number
+        self.goalkeeper_positions: Dict[str, List[Tuple[float, float, int]]] = {
+            "home": [],  # (x, y, frame_number)
+            "away": []
+        }
+
+        # Continuous tracking for specific players by jersey number
+        # Stores position history for each (team, jersey_number)
+        self.tracked_positions: Dict[Tuple[str, int], List[Tuple[float, float, int]]] = {}
+
+        # Standard football positions by jersey number (typical assignments)
+        self.position_names = {
+            1: "Goalkeeper",
+            2: "Right Back",
+            3: "Left Back",
+            4: "Center Back",
+            5: "Center Back",
+            6: "Defensive Midfielder",
+            7: "Right Winger",
+            8: "Central Midfielder",
+            9: "Striker",
+            10: "Attacking Midfielder",
+            11: "Left Winger"
+        }
+
         # Video info
         self.fps: float = 30.0
         self.total_frames: int = 0
@@ -84,6 +110,15 @@ class PitchVisualizationService:
         """Set video metadata."""
         self.fps = fps
         self.total_frames = total_frames
+
+    def _is_goalkeeper_position(self, team: str, x: float, y: float) -> bool:
+        """Check if position is in goalkeeper area (near goal)."""
+        # Home goalkeeper typically on left (x < 15), away on right (x > 85)
+        # Also check y is centered (goal area is roughly 30-70 on y axis)
+        if team == "home":
+            return x < 18 and 20 < y < 80
+        else:  # away
+            return x > 82 and 20 < y < 80
 
     def record_player_position(
         self,
@@ -115,6 +150,32 @@ class PitchVisualizationService:
         self.current_player_positions[(team, jersey_number)] = (x, y)
         self.current_frame = frame_number
         self.current_timestamp_ms = timestamp_ms
+
+        # Continuous tracking for all players by jersey number
+        key = (team, jersey_number)
+        if key not in self.tracked_positions:
+            self.tracked_positions[key] = []
+
+        self.tracked_positions[key].append((x, y, frame_number))
+        # Keep last 500 positions per player for movement analysis
+        if len(self.tracked_positions[key]) > 500:
+            self.tracked_positions[key] = self.tracked_positions[key][-500:]
+
+        # Identify and track goalkeeper
+        # Goalkeeper is jersey #1 OR player consistently in goal area
+        is_gk_position = self._is_goalkeeper_position(team, x, y)
+
+        if jersey_number == 1 or is_gk_position:
+            # If no goalkeeper identified yet, or this is jersey #1, set as goalkeeper
+            if team not in self.goalkeepers or jersey_number == 1:
+                self.goalkeepers[team] = jersey_number
+
+            # Track goalkeeper movement if this is the identified goalkeeper
+            if self.goalkeepers.get(team) == jersey_number:
+                self.goalkeeper_positions[team].append((x, y, frame_number))
+                # Keep only last 100 positions for memory efficiency
+                if len(self.goalkeeper_positions[team]) > 100:
+                    self.goalkeeper_positions[team] = self.goalkeeper_positions[team][-100:]
 
     def record_ball_position(
         self,
@@ -256,11 +317,31 @@ class PitchVisualizationService:
             }
         }
 
+    def _filter_on_pitch_players(self, player_list: List[Dict], max_players: int = 11) -> List[Dict]:
+        """
+        Filter players to only those on the pitch and limit to max per team.
+
+        Players must be within pitch bounds (5-95 for x and y to exclude sidelines).
+        Returns the most recently active players up to max_players.
+        """
+        # Filter to players within pitch bounds (exclude dugouts, sidelines, etc.)
+        on_pitch = [
+            p for p in player_list
+            if 3 <= p.get("x", 0) <= 97 and 3 <= p.get("y", 0) <= 97
+        ]
+
+        # Sort by jersey number to get consistent ordering
+        on_pitch.sort(key=lambda p: p.get("jersey_number", 99))
+
+        # Limit to max players per team (11 for football)
+        return on_pitch[:max_players]
+
     def get_2d_radar_state(self, frame_number: Optional[int] = None) -> Dict:
         """
         Get the 2D radar state at a specific frame or current state.
 
-        Returns player positions, ball position, and connection lines.
+        Returns player positions (max 11 per team), ball position, and referee positions.
+        Filters out players outside pitch bounds (coaches, subs, fans).
         """
         if frame_number is not None:
             # Find positions at specific frame
@@ -286,12 +367,17 @@ class PitchVisualizationService:
             }
 
             for (team, jersey), data in frame_positions.items():
-                players[team].append({
-                    "jersey_number": jersey,
-                    "x": data["x"],
-                    "y": data["y"],
-                    "has_ball": data["has_ball"]
-                })
+                if team in ["home", "away"]:
+                    players[team].append({
+                        "jersey_number": jersey,
+                        "x": data["x"],
+                        "y": data["y"],
+                        "has_ball": data["has_ball"]
+                    })
+
+            # Filter and limit to 11 players per team
+            players["home"] = self._filter_on_pitch_players(players["home"], max_players=11)
+            players["away"] = self._filter_on_pitch_players(players["away"], max_players=11)
 
             return {
                 "frame_number": frame_number,
@@ -306,11 +392,18 @@ class PitchVisualizationService:
             }
 
             for (team, jersey), (x, y) in self.current_player_positions.items():
-                players[team].append({
-                    "jersey_number": jersey,
-                    "x": x,
-                    "y": y
-                })
+                if team in ["home", "away"]:
+                    players[team].append({
+                        "jersey_number": jersey,
+                        "x": x,
+                        "y": y,
+                        "position": self.position_names.get(jersey, f"Player #{jersey}"),
+                        "is_goalkeeper": self.goalkeepers.get(team) == jersey
+                    })
+
+            # Filter and limit to 11 players per team
+            players["home"] = self._filter_on_pitch_players(players["home"], max_players=11)
+            players["away"] = self._filter_on_pitch_players(players["away"], max_players=11)
 
             return {
                 "frame_number": self.current_frame,
@@ -342,6 +435,54 @@ class PitchVisualizationService:
         ]
 
         return sorted(positions, key=lambda x: x["frame"])
+
+    def get_player_continuous_tracking(self, team: str, jersey_number: int) -> Dict:
+        """
+        Get continuous tracking data for a specific player.
+
+        Returns all recorded positions for the player, useful for
+        tracking specific positions like goalkeeper (#1) or right back (#2).
+
+        Args:
+            team: 'home' or 'away'
+            jersey_number: Player's jersey number
+
+        Returns:
+            Dictionary with player info and position history
+        """
+        key = (team, jersey_number)
+        positions = self.tracked_positions.get(key, [])
+
+        # Calculate stats from tracking data
+        if positions:
+            xs = [p[0] for p in positions]
+            ys = [p[1] for p in positions]
+            avg_x = sum(xs) / len(xs)
+            avg_y = sum(ys) / len(ys)
+
+            # Calculate distance covered (sum of distances between consecutive positions)
+            total_distance = 0
+            for i in range(1, len(positions)):
+                dx = positions[i][0] - positions[i-1][0]
+                dy = positions[i][1] - positions[i-1][1]
+                total_distance += (dx**2 + dy**2) ** 0.5
+        else:
+            avg_x, avg_y, total_distance = 0, 0, 0
+
+        return {
+            "team": team,
+            "jersey_number": jersey_number,
+            "position_name": self.position_names.get(jersey_number, f"Player #{jersey_number}"),
+            "is_goalkeeper": self.goalkeepers.get(team) == jersey_number,
+            "total_samples": len(positions),
+            "average_position": {"x": round(avg_x, 1), "y": round(avg_y, 1)},
+            "distance_covered_units": round(total_distance, 1),
+            "current_position": {"x": positions[-1][0], "y": positions[-1][1]} if positions else None,
+            "position_history": [
+                {"x": p[0], "y": p[1], "frame": p[2]}
+                for p in positions[-100:]  # Return last 100 positions
+            ]
+        }
 
     def get_possession_zones(
         self,
@@ -517,6 +658,10 @@ class PitchVisualizationService:
         self.current_ball_position = None
         self.current_frame = 0
         self.current_timestamp_ms = 0
+        self.goalkeepers.clear()
+        self.goalkeeper_positions = {"home": [], "away": []}
+        if hasattr(self, 'tracked_positions'):
+            self.tracked_positions.clear()
 
 
 # Global instance
