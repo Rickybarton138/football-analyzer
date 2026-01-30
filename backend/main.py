@@ -33,6 +33,7 @@ from services.tracking import TrackingService
 from services.pitch_mapping import PitchMapper
 from services.ball_detection import BallDetectionService
 from services.event_detection import EventDetectionService, event_detection_service
+from services.ai_jersey_detection import ai_jersey_detection_service
 from services.analytics import AnalyticsEngine
 from ai.tactical_analyzer import TacticalAnalyzer
 from ai.recommendation import RecommendationEngine
@@ -462,6 +463,27 @@ async def process_video(
             # Run tracking
             tracked = await services["tracking"].update(detections, frame_data["frame_number"])
 
+            # AI Jersey Detection - run on tracked players
+            try:
+                if settings.AI_JERSEY_DETECTION_ENABLED and settings.OPENAI_API_KEY:
+                    # Initialize on first frame if needed
+                    if frame_count == 1 and ai_jersey_detection_service.client is None:
+                        await ai_jersey_detection_service.initialize(
+                            openai_api_key=settings.OPENAI_API_KEY,
+                            provider=settings.AI_JERSEY_PROVIDER
+                        )
+                        print("[JERSEY] AI Jersey Detection initialized")
+
+                    # Process frame for jersey numbers
+                    tracked = await ai_jersey_detection_service.process_frame(
+                        frame=frame_data["frame"],
+                        players=tracked,
+                        frame_number=frame_data["frame_number"]
+                    )
+            except Exception as e:
+                if frame_count <= 3:
+                    print(f"[JERSEY] Warning: {e}")
+
             # Ball detection
             ball = await services["ball"].detect(frame_data["frame"])
 
@@ -773,6 +795,140 @@ async def dismiss_alert(match_id: str, alert_id: str):
     state = match_states[match_id]
     state.active_alerts = [a for a in state.active_alerts if a.alert_id != alert_id]
     return {"message": "Alert dismissed"}
+
+
+# ============== Jersey Detection Endpoints ==============
+
+@app.get("/api/match/{match_id}/jersey-detections")
+async def get_jersey_detections(match_id: str):
+    """
+    Get all detected jersey numbers for a match.
+
+    Returns both confirmed and pending detections from the AI jersey detection service.
+    """
+    # Get all detections from the AI service
+    detections = ai_jersey_detection_service.get_all_detections()
+    stats = ai_jersey_detection_service.get_stats()
+
+    return {
+        "match_id": match_id,
+        "detections": detections,
+        "statistics": stats,
+        "message": f"Found {len(detections)} player jersey detections"
+    }
+
+
+@app.post("/api/match/{match_id}/jersey-correction")
+async def correct_jersey_number(
+    match_id: str,
+    track_id: int,
+    jersey_number: int
+):
+    """
+    Manually correct a player's jersey number.
+
+    Use this endpoint when the AI detection is wrong or when you want to
+    manually assign a jersey number to a player.
+
+    Args:
+        match_id: The match ID (for context)
+        track_id: The player's tracking ID
+        jersey_number: The correct jersey number (1-99)
+    """
+    # Validate jersey number
+    if jersey_number < 1 or jersey_number > 99:
+        raise HTTPException(
+            status_code=400,
+            detail="Jersey number must be between 1 and 99"
+        )
+
+    # Set the manual correction
+    ai_jersey_detection_service.set_manual_correction(track_id, jersey_number)
+
+    return {
+        "match_id": match_id,
+        "track_id": track_id,
+        "jersey_number": jersey_number,
+        "message": f"Jersey number for player {track_id} corrected to #{jersey_number}"
+    }
+
+
+@app.get("/api/match/{match_id}/jersey-stats")
+async def get_jersey_detection_stats(match_id: str):
+    """
+    Get statistics about jersey number detection for a match.
+
+    Returns information about API calls made, detection success rates,
+    and the current state of player identification.
+    """
+    stats = ai_jersey_detection_service.get_stats()
+
+    return {
+        "match_id": match_id,
+        "provider": stats.get("provider", "none"),
+        "api_calls": stats.get("api_calls", 0),
+        "total_players_processed": stats.get("total_players_processed", 0),
+        "successful_detections": stats.get("successful_detections", 0),
+        "confirmed_players": stats.get("confirmed_players", 0),
+        "pending_observations": stats.get("pending_observations", 0),
+        "manual_corrections": stats.get("manual_corrections", 0),
+        "detection_rate": (
+            stats.get("successful_detections", 0) /
+            max(stats.get("total_players_processed", 1), 1) * 100
+        )
+    }
+
+
+@app.post("/api/jersey-detection/initialize")
+async def initialize_jersey_detection(
+    openai_api_key: Optional[str] = None,
+    anthropic_api_key: Optional[str] = None,
+    provider: str = "openai"
+):
+    """
+    Initialize or reinitialize the AI jersey detection service.
+
+    Use this endpoint to set up jersey detection with API keys or
+    to switch between providers (OpenAI/Claude).
+
+    Args:
+        openai_api_key: OpenAI API key for GPT-4V (optional, uses settings if not provided)
+        anthropic_api_key: Anthropic API key for Claude Vision (optional)
+        provider: Primary provider to use ("openai" or "claude")
+    """
+    success = await ai_jersey_detection_service.initialize(
+        openai_api_key=openai_api_key,
+        anthropic_api_key=anthropic_api_key,
+        provider=provider
+    )
+
+    if success:
+        return {
+            "status": "initialized",
+            "provider": ai_jersey_detection_service.provider,
+            "message": f"AI jersey detection initialized with {ai_jersey_detection_service.provider}"
+        }
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to initialize jersey detection. Please provide valid API keys."
+        )
+
+
+@app.post("/api/jersey-detection/reset")
+async def reset_jersey_detection():
+    """
+    Reset all jersey detection data.
+
+    Clears all observations, confirmed players, and manual corrections.
+    Use this when starting analysis of a new match.
+    """
+    ai_jersey_detection_service.reset()
+
+    return {
+        "status": "reset",
+        "message": "Jersey detection service reset successfully"
+    }
 
 
 # ============== WebSocket Endpoints ==============

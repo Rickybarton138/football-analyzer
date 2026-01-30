@@ -15,10 +15,12 @@ import json
 import time
 from datetime import datetime
 
-# Import for player highlights tracking and jersey OCR
+# Import for player highlights tracking and jersey detection
 from models.schemas import DetectedPlayer, BoundingBox, PixelPosition, TeamSide
 from services.player_highlights import player_highlights_service
 from services.jersey_ocr import jersey_ocr_service
+from services.ai_jersey_detection import ai_jersey_detection_service
+from config import settings
 
 # Import professional analytics services (VEO-style)
 from services.match_statistics import match_statistics_service, EventType as StatsEventType
@@ -111,6 +113,10 @@ class BallTracker:
             return None
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+
+        # Ensure frames have same size (handle resolution changes)
+        if gray.shape != self.prev_frame.shape:
+            self.prev_frame = cv2.resize(self.prev_frame, (gray.shape[1], gray.shape[0]))
 
         # Frame difference
         diff = cv2.absdiff(gray, self.prev_frame)
@@ -608,15 +614,38 @@ class LocalVideoProcessor:
 
         coach_assist_service.reset()
 
-        # Initialize jersey OCR service for player identification
-        # Note: OCR can be slow to initialize, so we make it optional
+        # Initialize jersey detection services
+        # AI jersey detection (GPT-4V/Claude Vision) is preferred over traditional OCR
         jersey_ocr_service.reset()
-        try:
-            await jersey_ocr_service.initialize()
-            ocr_enabled = jersey_ocr_service.ocr_engine is not None
-        except Exception as e:
-            print(f"OCR initialization failed: {e}. Continuing without OCR.")
-            ocr_enabled = False
+        ai_jersey_detection_service.reset()
+
+        ai_jersey_enabled = False
+        ocr_enabled = False
+
+        # Try AI jersey detection first (more accurate)
+        if settings.AI_JERSEY_DETECTION_ENABLED and settings.OPENAI_API_KEY:
+            try:
+                ai_jersey_enabled = await ai_jersey_detection_service.initialize(
+                    openai_api_key=settings.OPENAI_API_KEY,
+                    anthropic_api_key=getattr(settings, 'ANTHROPIC_API_KEY', None),
+                    provider=settings.AI_JERSEY_PROVIDER
+                )
+                if ai_jersey_enabled:
+                    print("AI Jersey Detection: Initialized successfully")
+            except Exception as e:
+                print(f"AI Jersey Detection initialization failed: {e}")
+                ai_jersey_enabled = False
+
+        # Fall back to traditional OCR if AI not available
+        if not ai_jersey_enabled:
+            try:
+                await jersey_ocr_service.initialize()
+                ocr_enabled = jersey_ocr_service.ocr_engine is not None
+                if ocr_enabled:
+                    print("Traditional OCR: Initialized as fallback")
+            except Exception as e:
+                print(f"OCR initialization failed: {e}. Continuing without jersey detection.")
+                ocr_enabled = False
 
         self.status = "processing"
         frame_count = 0
@@ -701,19 +730,34 @@ class LocalVideoProcessor:
                         )
                         detected_players_for_highlights.append(detected_player)
 
-                # Run jersey OCR periodically (every 30 frames to save CPU)
-                # OCR will update player.jersey_number when numbers are confirmed
-                if ocr_enabled and detected_players_for_highlights and analyzed_count % 30 == 0:
-                    detected_players_for_highlights = await jersey_ocr_service.process_players(
-                        frame=frame,
-                        players=detected_players_for_highlights,
-                        frame_number=frame_count
-                    )
+                # Run jersey number detection
+                # AI jersey detection is preferred (more accurate), falls back to OCR
+                if detected_players_for_highlights:
+                    if ai_jersey_enabled:
+                        # AI detection handles its own frame interval internally
+                        detected_players_for_highlights = await ai_jersey_detection_service.process_frame(
+                            frame=frame,
+                            players=detected_players_for_highlights,
+                            frame_number=frame_count
+                        )
+                    elif ocr_enabled and analyzed_count % 30 == 0:
+                        # Traditional OCR fallback (every 30 frames to save CPU)
+                        detected_players_for_highlights = await jersey_ocr_service.process_players(
+                            frame=frame,
+                            players=detected_players_for_highlights,
+                            frame_number=frame_count
+                        )
 
                 # Use enhanced ball tracker (combines YOLO, motion, and color detection)
-                ball_pos = self.ball_tracker.detect_ball(frame, yolo_ball_pos, player_boxes)
-                if ball_pos:
-                    frame_analysis.ball_position = ball_pos
+                try:
+                    ball_pos = self.ball_tracker.detect_ball(frame, yolo_ball_pos, player_boxes)
+                    if ball_pos:
+                        frame_analysis.ball_position = ball_pos
+                except Exception as e:
+                    # Ball tracker can fail on some frames - don't crash the whole pipeline
+                    if analyzed_count <= 3:
+                        print(f"Ball tracker error (will continue): {e}")
+                    ball_pos = yolo_ball_pos  # Fall back to YOLO ball position
 
                 # Determine ball possession and track player moments
                 ball_possessed_by = self._determine_ball_possession(ball_pos, player_detections if model else [])
@@ -835,6 +879,22 @@ class LocalVideoProcessor:
             print(f"Average players detected: {avg_total:.1f} (home: {self.current_analysis.avg_home_players:.1f}, away: {self.current_analysis.avg_away_players:.1f})")
             print(f"Frames with good coverage (>={self.EXPECTED_PLAYERS_MIN}): {good_coverage}/{len(total_counts)} ({coverage_pct:.1f}%)")
             print(f"Min/Max detections: {min(total_counts)}/{max(total_counts)}")
+
+        # Jersey detection summary
+        if ai_jersey_enabled:
+            jersey_stats = ai_jersey_detection_service.get_stats()
+            print(f"\n=== AI Jersey Detection Summary ===")
+            print(f"Provider: {jersey_stats['provider']}")
+            print(f"API calls: {jersey_stats['api_calls']}")
+            print(f"Players processed: {jersey_stats['total_players_processed']}")
+            print(f"Successful detections: {jersey_stats['successful_detections']}")
+            print(f"Confirmed players: {jersey_stats['confirmed_players']}")
+        elif ocr_enabled:
+            ocr_stats = jersey_ocr_service.get_stats()
+            print(f"\n=== OCR Jersey Detection Summary ===")
+            print(f"OCR attempts: {ocr_stats['total_ocr_attempts']}")
+            print(f"Successful reads: {ocr_stats['successful_reads']}")
+            print(f"Players identified: {ocr_stats['players_identified']}")
 
         # Finalize professional analytics services
         print(f"\n=== Professional Analytics Summary ===")

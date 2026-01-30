@@ -77,6 +77,18 @@ class Settings(BaseSettings):
     # OpenAI (alternative to Gemini)
     OPENAI_API_KEY: Optional[str] = None
 
+    # Anthropic (Claude Vision)
+    ANTHROPIC_API_KEY: Optional[str] = None
+
+    # AI Jersey Detection Settings
+    AI_JERSEY_DETECTION_ENABLED: bool = True
+    AI_JERSEY_PROVIDER: str = "openai"  # "openai" or "claude"
+    AI_JERSEY_BATCH_SIZE: int = 6  # Players per API call
+    AI_JERSEY_MIN_CONFIDENCE: float = 0.6  # Minimum confidence to accept
+    AI_JERSEY_MIN_OBSERVATIONS: int = 3  # Observations needed to confirm
+    AI_JERSEY_PROCESS_INTERVAL: int = 30  # Process every N frames
+    AI_JERSEY_MIN_BBOX_HEIGHT: int = 50  # Skip small bounding boxes
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

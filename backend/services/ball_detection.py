@@ -175,6 +175,10 @@ class BallDetectionService:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         prev_gray = cv2.cvtColor(self.prev_frame, cv2.COLOR_BGR2GRAY)
 
+        # Ensure frames have same size (handle resolution changes)
+        if gray.shape != prev_gray.shape:
+            prev_gray = cv2.resize(prev_gray, (gray.shape[1], gray.shape[0]))
+
         # Frame difference
         diff = cv2.absdiff(gray, prev_gray)
         _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
