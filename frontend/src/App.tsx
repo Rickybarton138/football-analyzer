@@ -36,7 +36,7 @@ interface Detection {
 }
 
 // Simplified tab structure - consolidated from 13 to 5 main views + training + live
-type Tab = 'video' | 'analysis' | 'aicoach' | 'players' | 'tactical' | 'training' | 'live';
+type Tab = 'video' | 'analysis' | 'aicoach' | 'players' | 'tactical' | 'training' | 'live' | 'jersey';
 
 // Shot detection types
 interface DetectedShot {
@@ -1021,6 +1021,7 @@ function App() {
     { id: 'players', label: 'Players', icon: '👤', description: 'Individual player statistics' },
     { id: 'training', label: 'Training Data', icon: '🎯', description: 'Annotate frames for ML training' },
     { id: 'live', label: 'Live Coaching', icon: '📡', description: 'Real-time game management' },
+    { id: 'jersey', label: 'Jersey Detection', icon: '🔢', description: 'AI-powered jersey number detection' },
   ];
 
   return (
@@ -1114,6 +1115,7 @@ function App() {
         {activeTab === 'players' && <PlayersView />}
         {activeTab === 'training' && <AnnotationUIView />}
         {activeTab === 'live' && <LiveCoaching />}
+        {activeTab === 'jersey' && <JerseyDetectionView />}
       </main>
     </div>
   );
@@ -4079,6 +4081,348 @@ interface TrackedPlayerData {
     confidence: number;
   } | null;
   trajectory: Array<[number, number]>;
+}
+
+// ==================== JERSEY DETECTION VIEW ====================
+interface JerseyDetection {
+  jersey_number: number;
+  team: string;
+  confidence: number;
+  observation_count: number;
+  confirmed: boolean;
+  manually_corrected: boolean;
+  pending?: boolean;
+}
+
+interface JerseyStats {
+  provider: string;
+  api_calls: number;
+  total_players_processed: number;
+  successful_detections: number;
+  confirmed_players: number;
+  pending_observations: number;
+  manual_corrections: number;
+}
+
+function JerseyDetectionView() {
+  const [detections, setDetections] = useState<Record<string, JerseyDetection>>({});
+  const [stats, setStats] = useState<JerseyStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [correctionTrackId, setCorrectionTrackId] = useState('');
+  const [correctionJerseyNumber, setCorrectionJerseyNumber] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const fetchData = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [detectionsRes, statsRes] = await Promise.all([
+        fetch('http://localhost:8000/api/match/current/jersey-detections'),
+        fetch('http://localhost:8000/api/match/current/jersey-stats')
+      ]);
+
+      if (detectionsRes.ok) {
+        const data = await detectionsRes.json();
+        setDetections(data.detections || {});
+      }
+
+      if (statsRes.ok) {
+        const data = await statsRes.json();
+        setStats(data);
+      }
+    } catch (err) {
+      setError('Failed to load jersey detection data');
+      console.error(err);
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    fetchData();
+    // Auto-refresh every 10 seconds
+    const interval = setInterval(fetchData, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleCorrection = async () => {
+    if (!correctionTrackId || !correctionJerseyNumber) {
+      alert('Please enter both Track ID and Jersey Number');
+      return;
+    }
+
+    const jerseyNum = parseInt(correctionJerseyNumber);
+    if (isNaN(jerseyNum) || jerseyNum < 1 || jerseyNum > 99) {
+      alert('Jersey number must be between 1 and 99');
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const response = await fetch(
+        `http://localhost:8000/api/match/current/jersey-correction?track_id=${correctionTrackId}&jersey_number=${jerseyNum}`,
+        { method: 'POST' }
+      );
+
+      if (response.ok) {
+        setCorrectionTrackId('');
+        setCorrectionJerseyNumber('');
+        fetchData(); // Refresh data
+      } else {
+        const data = await response.json();
+        alert(data.detail || 'Failed to save correction');
+      }
+    } catch (err) {
+      alert('Failed to save correction');
+    }
+    setSubmitting(false);
+  };
+
+  const handleReset = async () => {
+    if (!confirm('Are you sure you want to reset all jersey detections? This cannot be undone.')) {
+      return;
+    }
+
+    try {
+      const response = await fetch('http://localhost:8000/api/jersey-detection/reset', { method: 'POST' });
+      if (response.ok) {
+        fetchData();
+      }
+    } catch (err) {
+      alert('Failed to reset');
+    }
+  };
+
+  // Group detections by jersey number for summary
+  const jerseyNumberCounts = useMemo(() => {
+    const counts: Record<number, number> = {};
+    Object.values(detections).forEach(d => {
+      counts[d.jersey_number] = (counts[d.jersey_number] || 0) + 1;
+    });
+    return Object.entries(counts)
+      .sort((a, b) => parseInt(a[0]) - parseInt(b[0]))
+      .map(([num, count]) => ({ number: parseInt(num), count }));
+  }, [detections]);
+
+  const confirmedDetections = Object.entries(detections).filter(([_, d]) => d.confirmed);
+  const pendingDetections = Object.entries(detections).filter(([_, d]) => !d.confirmed);
+
+  if (loading && !stats) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-cyan-500"></div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-white">AI Jersey Detection</h2>
+          <p className="text-slate-400 text-sm mt-1">
+            Powered by GPT-4 Vision • Detects jersey numbers from video frames
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={fetchData}
+            className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-sm transition-colors"
+          >
+            🔄 Refresh
+          </button>
+          <button
+            onClick={handleReset}
+            className="px-4 py-2 bg-red-600/20 hover:bg-red-600/30 text-red-400 rounded-lg text-sm transition-colors"
+          >
+            🗑️ Reset All
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4 text-red-400">
+          {error}
+        </div>
+      )}
+
+      {/* Stats Cards */}
+      {stats && (
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4">
+          <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50">
+            <div className="text-2xl font-bold text-cyan-400">{stats.provider || 'N/A'}</div>
+            <div className="text-xs text-slate-400 mt-1">Provider</div>
+          </div>
+          <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50">
+            <div className="text-2xl font-bold text-white">{stats.api_calls}</div>
+            <div className="text-xs text-slate-400 mt-1">API Calls</div>
+          </div>
+          <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50">
+            <div className="text-2xl font-bold text-white">{stats.total_players_processed}</div>
+            <div className="text-xs text-slate-400 mt-1">Players Processed</div>
+          </div>
+          <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50">
+            <div className="text-2xl font-bold text-green-400">{stats.successful_detections}</div>
+            <div className="text-xs text-slate-400 mt-1">Successful</div>
+          </div>
+          <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50">
+            <div className="text-2xl font-bold text-emerald-400">{stats.confirmed_players}</div>
+            <div className="text-xs text-slate-400 mt-1">Confirmed</div>
+          </div>
+          <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50">
+            <div className="text-2xl font-bold text-yellow-400">{stats.pending_observations}</div>
+            <div className="text-xs text-slate-400 mt-1">Pending</div>
+          </div>
+          <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50">
+            <div className="text-2xl font-bold text-purple-400">{stats.manual_corrections}</div>
+            <div className="text-xs text-slate-400 mt-1">Manual Fixes</div>
+          </div>
+        </div>
+      )}
+
+      {/* Jersey Numbers Summary */}
+      {jerseyNumberCounts.length > 0 && (
+        <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50">
+          <h3 className="text-lg font-semibold text-white mb-3">Detected Jersey Numbers</h3>
+          <div className="flex flex-wrap gap-2">
+            {jerseyNumberCounts.map(({ number, count }) => (
+              <div
+                key={number}
+                className="px-3 py-2 bg-slate-700/50 rounded-lg border border-slate-600/50 flex items-center gap-2"
+              >
+                <span className="text-xl font-bold text-cyan-400">#{number}</span>
+                <span className="text-xs text-slate-400">({count}x)</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Manual Correction Form */}
+      <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50">
+        <h3 className="text-lg font-semibold text-white mb-3">Manual Correction</h3>
+        <p className="text-sm text-slate-400 mb-4">
+          Correct a detection by entering the Track ID and the correct jersey number.
+        </p>
+        <div className="flex gap-4 items-end">
+          <div>
+            <label className="block text-sm text-slate-400 mb-1">Track ID</label>
+            <input
+              type="text"
+              value={correctionTrackId}
+              onChange={e => setCorrectionTrackId(e.target.value)}
+              placeholder="e.g. 139"
+              className="px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white w-32 focus:outline-none focus:border-cyan-500"
+            />
+          </div>
+          <div>
+            <label className="block text-sm text-slate-400 mb-1">Jersey Number</label>
+            <input
+              type="number"
+              min="1"
+              max="99"
+              value={correctionJerseyNumber}
+              onChange={e => setCorrectionJerseyNumber(e.target.value)}
+              placeholder="1-99"
+              className="px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white w-24 focus:outline-none focus:border-cyan-500"
+            />
+          </div>
+          <button
+            onClick={handleCorrection}
+            disabled={submitting}
+            className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-600 text-white rounded-lg transition-colors"
+          >
+            {submitting ? 'Saving...' : 'Save Correction'}
+          </button>
+        </div>
+      </div>
+
+      {/* Confirmed Detections */}
+      {confirmedDetections.length > 0 && (
+        <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50">
+          <h3 className="text-lg font-semibold text-white mb-3">
+            ✅ Confirmed Players ({confirmedDetections.length})
+          </h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-slate-400 border-b border-slate-700">
+                  <th className="pb-2 pr-4">Track ID</th>
+                  <th className="pb-2 pr-4">Jersey #</th>
+                  <th className="pb-2 pr-4">Team</th>
+                  <th className="pb-2 pr-4">Confidence</th>
+                  <th className="pb-2 pr-4">Observations</th>
+                  <th className="pb-2">Source</th>
+                </tr>
+              </thead>
+              <tbody>
+                {confirmedDetections.map(([trackId, detection]) => (
+                  <tr key={trackId} className="border-b border-slate-700/50 text-white">
+                    <td className="py-2 pr-4 font-mono text-slate-400">{trackId}</td>
+                    <td className="py-2 pr-4">
+                      <span className="text-xl font-bold text-cyan-400">#{detection.jersey_number}</span>
+                    </td>
+                    <td className="py-2 pr-4 capitalize">{detection.team}</td>
+                    <td className="py-2 pr-4">{(detection.confidence * 100).toFixed(0)}%</td>
+                    <td className="py-2 pr-4">{detection.observation_count}</td>
+                    <td className="py-2">
+                      {detection.manually_corrected ? (
+                        <span className="px-2 py-1 bg-purple-500/20 text-purple-400 rounded text-xs">Manual</span>
+                      ) : (
+                        <span className="px-2 py-1 bg-green-500/20 text-green-400 rounded text-xs">AI</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Pending Detections */}
+      {pendingDetections.length > 0 && (
+        <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700/50">
+          <h3 className="text-lg font-semibold text-white mb-3">
+            ⏳ Pending Observations ({pendingDetections.length})
+          </h3>
+          <p className="text-sm text-slate-400 mb-4">
+            These detections need more observations to be confirmed (requires 3+ consistent observations).
+          </p>
+          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
+            {pendingDetections.slice(0, 30).map(([trackId, detection]) => (
+              <div
+                key={trackId}
+                className="bg-slate-700/30 rounded-lg p-3 border border-slate-600/30"
+              >
+                <div className="text-lg font-bold text-yellow-400">#{detection.jersey_number}</div>
+                <div className="text-xs text-slate-400 mt-1">Track: {trackId}</div>
+                <div className="text-xs text-slate-500">Obs: {detection.observation_count}</div>
+              </div>
+            ))}
+            {pendingDetections.length > 30 && (
+              <div className="bg-slate-700/30 rounded-lg p-3 border border-slate-600/30 flex items-center justify-center">
+                <span className="text-slate-400">+{pendingDetections.length - 30} more</span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Empty State */}
+      {Object.keys(detections).length === 0 && !loading && (
+        <div className="bg-slate-800/50 rounded-lg p-8 border border-slate-700/50 text-center">
+          <div className="text-4xl mb-4">🔢</div>
+          <h3 className="text-xl font-semibold text-white mb-2">No Jersey Detections Yet</h3>
+          <p className="text-slate-400 max-w-md mx-auto">
+            Process a video to detect jersey numbers using AI. The system will automatically
+            identify jersey numbers from player images using GPT-4 Vision.
+          </p>
+        </div>
+      )}
+    </div>
+  );
 }
 
 interface TrackingAnalysis {
