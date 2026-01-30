@@ -15,6 +15,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, H
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 import aiofiles
 
 from config import settings
@@ -5315,6 +5316,251 @@ async def reset_highlights():
     player_highlights_service.reset()
     jersey_ocr_service.reset()
     return {"status": "reset"}
+
+
+# ==================== PLAYER SPOTLIGHT ENDPOINTS ====================
+
+class ClipGenerateRequest(BaseModel):
+    """Request body for clip generation."""
+    start_frame: int
+    end_frame: int
+    player_track_id: Optional[str] = None
+    moment_type: Optional[str] = None
+    description: Optional[str] = None
+
+
+@app.post("/api/clips/generate")
+async def generate_clip_from_frames(request: ClipGenerateRequest):
+    """
+    Generate a video clip from specific frame boundaries.
+
+    This is used by the Player Spotlight feature to create clips of specific moments.
+
+    Args:
+        start_frame: Starting frame number
+        end_frame: Ending frame number
+        player_track_id: Optional player tracking ID
+        moment_type: Type of moment (ball_touch, pass, shot, etc.)
+        description: Optional description of the moment
+
+    Returns:
+        Clip metadata including file path
+    """
+    import os
+    import uuid
+    from datetime import datetime
+
+    # Get current video info
+    if not hasattr(app.state, 'current_video_path') or not app.state.current_video_path:
+        raise HTTPException(status_code=400, detail="No video loaded")
+
+    video_path = app.state.current_video_path
+
+    # Create clips directory if it doesn't exist
+    clips_dir = os.path.join(os.path.dirname(video_path), "clips")
+    os.makedirs(clips_dir, exist_ok=True)
+
+    # Generate clip ID and output path
+    clip_id = f"clip_{request.moment_type or 'moment'}_{uuid.uuid4().hex[:8]}"
+    output_path = os.path.join(clips_dir, f"{clip_id}.mp4")
+
+    try:
+        import cv2
+
+        # Open video
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Set up video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+        # Seek to start frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, request.start_frame)
+
+        # Extract frames
+        frames_written = 0
+        for frame_num in range(request.start_frame, request.end_frame + 1):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            out.write(frame)
+            frames_written += 1
+
+        cap.release()
+        out.release()
+
+        duration_seconds = frames_written / fps if fps > 0 else 0
+
+        return {
+            "status": "success",
+            "clip_id": clip_id,
+            "clip_path": output_path,
+            "start_frame": request.start_frame,
+            "end_frame": request.end_frame,
+            "frames_extracted": frames_written,
+            "duration_seconds": round(duration_seconds, 2),
+            "player_track_id": request.player_track_id,
+            "moment_type": request.moment_type,
+            "description": request.description,
+            "created_at": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate clip: {str(e)}")
+
+
+@app.get("/api/players/spotlight/profiles")
+async def get_spotlight_profiles():
+    """
+    Get all player profiles for the Player Spotlight feature.
+
+    Combines jersey detection data with tracking data to build player profiles.
+
+    Returns:
+        List of player profiles with stats
+    """
+    profiles = []
+
+    # Get jersey detections
+    jersey_data = ai_jersey_detection_service.get_all_detections()
+
+    # Get average positions for both teams
+    home_positions = pitch_visualization_service.get_average_positions("home")
+    away_positions = pitch_visualization_service.get_average_positions("away")
+
+    # Build profiles from jersey detections
+    for track_id, info in jersey_data.items():
+        jersey_number = info.get("confirmed_number")
+        if not jersey_number:
+            continue
+
+        team = info.get("team", "home")
+
+        # Find average position
+        positions = home_positions if team == "home" else away_positions
+        avg_pos = next(
+            (p for p in positions if p.get("jersey_number") == jersey_number),
+            {"x": 50, "y": 50}
+        )
+
+        # Get player events from highlights service
+        events = player_highlights_service.get_player_events(jersey_number) if hasattr(player_highlights_service, 'get_player_events') else []
+
+        ball_touches = len([e for e in events if e.event_type in ['ball_touch', 'pass', 'shot', 'dribble']])
+        passes = len([e for e in events if e.event_type == 'pass'])
+        shots = len([e for e in events if e.event_type == 'shot'])
+        tackles = len([e for e in events if e.event_type == 'tackle'])
+
+        profiles.append({
+            "track_id": track_id,
+            "jersey_number": jersey_number,
+            "team": team,
+            "total_moments": len(events),
+            "ball_touches": ball_touches,
+            "passes": passes,
+            "shots": shots,
+            "tackles": tackles,
+            "distance_covered_m": 0,  # Would need tracking data
+            "avg_position": {"x": avg_pos.get("x", 50), "y": avg_pos.get("y", 50)}
+        })
+
+    # If no jersey detections, create placeholder profiles from visualization data
+    if not profiles:
+        for pos in home_positions:
+            profiles.append({
+                "track_id": f"home_{pos['jersey_number']}",
+                "jersey_number": pos["jersey_number"],
+                "team": "home",
+                "total_moments": 0,
+                "ball_touches": 0,
+                "passes": 0,
+                "shots": 0,
+                "tackles": 0,
+                "distance_covered_m": 0,
+                "avg_position": {"x": pos["x"], "y": pos["y"]}
+            })
+        for pos in away_positions:
+            profiles.append({
+                "track_id": f"away_{pos['jersey_number']}",
+                "jersey_number": pos["jersey_number"],
+                "team": "away",
+                "total_moments": 0,
+                "ball_touches": 0,
+                "passes": 0,
+                "shots": 0,
+                "tackles": 0,
+                "distance_covered_m": 0,
+                "avg_position": {"x": pos["x"], "y": pos["y"]}
+            })
+
+    return {"profiles": profiles, "total_players": len(profiles)}
+
+
+@app.get("/api/players/spotlight/{track_id}/moments")
+async def get_player_moments(
+    track_id: str,
+    moment_type: Optional[str] = None,
+    min_confidence: float = 0.5
+):
+    """
+    Get all moments for a specific player.
+
+    Moments are detected based on proximity to ball and specific actions.
+
+    Args:
+        track_id: Player tracking ID
+        moment_type: Filter by moment type (ball_touch, pass, shot, dribble, tackle, interception)
+        min_confidence: Minimum confidence threshold (0-1)
+
+    Returns:
+        List of player moments with timestamps and descriptions
+    """
+    # Extract jersey number from track_id
+    try:
+        jersey_number = int(track_id.split("_")[-1])
+    except ValueError:
+        # Try to get from jersey detection service
+        detection = ai_jersey_detection_service.get_player_info(track_id)
+        if detection and detection.get("confirmed_number"):
+            jersey_number = detection["confirmed_number"]
+        else:
+            jersey_number = None
+
+    if jersey_number is None:
+        raise HTTPException(status_code=404, detail=f"Player {track_id} not found")
+
+    # Get events from highlights service
+    events = []
+    if hasattr(player_highlights_service, 'get_player_events'):
+        all_events = player_highlights_service.get_player_events(jersey_number)
+        events = [
+            {
+                "id": f"moment_{i}",
+                "track_id": track_id,
+                "jersey_number": jersey_number,
+                "team": "home" if "home" in track_id else "away",
+                "start_frame": e.frame_start,
+                "end_frame": e.frame_end,
+                "start_time_ms": e.timestamp_start_ms,
+                "end_time_ms": e.timestamp_end_ms,
+                "moment_type": e.event_type,
+                "confidence": e.importance,
+                "description": e.description or f"{e.event_type.replace('_', ' ').title()}"
+            }
+            for i, e in enumerate(all_events)
+            if (moment_type is None or e.event_type == moment_type)
+            and e.importance >= min_confidence
+        ]
+
+    return {
+        "track_id": track_id,
+        "jersey_number": jersey_number,
+        "total_moments": len(events),
+        "moments": events
+    }
 
 
 @app.post("/api/highlights/build-from-detections")

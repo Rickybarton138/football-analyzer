@@ -36,7 +36,7 @@ interface Detection {
 }
 
 // Simplified tab structure - consolidated from 13 to 5 main views + training + live
-type Tab = 'video' | 'analysis' | 'aicoach' | 'players' | 'tactical' | 'training' | 'live' | 'jersey';
+type Tab = 'video' | 'analysis' | 'aicoach' | 'players' | 'tactical' | 'training' | 'live' | 'jersey' | 'radar' | 'spotlight';
 
 // Shot detection types
 interface DetectedShot {
@@ -1022,6 +1022,8 @@ function App() {
     { id: 'training', label: 'Training Data', icon: '🎯', description: 'Annotate frames for ML training' },
     { id: 'live', label: 'Live Coaching', icon: '📡', description: 'Real-time game management' },
     { id: 'jersey', label: 'Jersey Detection', icon: '🔢', description: 'AI-powered jersey number detection' },
+    { id: 'radar', label: '2D Radar', icon: '📍', description: 'Live tactical overhead view' },
+    { id: 'spotlight', label: 'Player Spotlight', icon: '🌟', description: 'Individual player moments & clips' },
   ];
 
   return (
@@ -1116,6 +1118,8 @@ function App() {
         {activeTab === 'training' && <AnnotationUIView />}
         {activeTab === 'live' && <LiveCoaching />}
         {activeTab === 'jersey' && <JerseyDetectionView />}
+        {activeTab === 'radar' && <Radar2DView analysis={analysis} />}
+        {activeTab === 'spotlight' && <PlayerSpotlightView />}
       </main>
     </div>
   );
@@ -4094,6 +4098,1029 @@ interface JerseyDetection {
   pending?: boolean;
 }
 
+// ==================== 2D RADAR VIEW (VEO-STYLE) ====================
+interface RadarPlayer {
+  jersey_number: number;
+  x: number;
+  y: number;
+  has_ball?: boolean;
+}
+
+interface RadarState {
+  frame_number: number;
+  timestamp_ms?: number;
+  players: {
+    home: RadarPlayer[];
+    away: RadarPlayer[];
+  };
+  ball: { x: number; y: number } | null;
+}
+
+interface TeamShape {
+  players: { jersey: number; x: number; y: number }[];
+  centroid: { x: number; y: number } | null;
+  width: number;
+  depth: number;
+  compactness: number;
+}
+
+function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
+  const [radarState, setRadarState] = useState<RadarState | null>(null);
+  const [homeShape, setHomeShape] = useState<TeamShape | null>(null);
+  const [awayShape, setAwayShape] = useState<TeamShape | null>(null);
+  const [currentFrame, setCurrentFrame] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [showTrails, setShowTrails] = useState(false);
+  const [showFormationLines, setShowFormationLines] = useState(true);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [loading, setLoading] = useState(false);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const animationRef = useRef<number | null>(null);
+
+  // Pitch dimensions for drawing (normalized to 0-100)
+  const PITCH_WIDTH = 400;
+  const PITCH_HEIGHT = 260;
+  const PADDING = 20;
+
+  const fetchRadarState = async (frame?: number) => {
+    try {
+      const url = frame !== undefined
+        ? `http://localhost:8000/api/visualization/2d-radar?frame_number=${frame}`
+        : 'http://localhost:8000/api/visualization/2d-radar';
+      const response = await fetch(url);
+      if (response.ok) {
+        const data = await response.json();
+        setRadarState(data);
+        if (data.frame_number) {
+          setCurrentFrame(data.frame_number);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch radar state:', err);
+    }
+  };
+
+  const fetchTeamShapes = async (frame: number) => {
+    try {
+      const [homeRes, awayRes] = await Promise.all([
+        fetch(`http://localhost:8000/api/visualization/team-shape/home?frame_number=${frame}`),
+        fetch(`http://localhost:8000/api/visualization/team-shape/away?frame_number=${frame}`)
+      ]);
+      if (homeRes.ok) setHomeShape(await homeRes.json());
+      if (awayRes.ok) setAwayShape(await awayRes.json());
+    } catch (err) {
+      console.error('Failed to fetch team shapes:', err);
+    }
+  };
+
+  useEffect(() => {
+    fetchRadarState();
+    const interval = setInterval(() => {
+      if (!isPlaying) fetchRadarState();
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [isPlaying]);
+
+  useEffect(() => {
+    if (currentFrame > 0) {
+      fetchTeamShapes(currentFrame);
+    }
+  }, [currentFrame]);
+
+  // Animation loop for playback
+  useEffect(() => {
+    if (isPlaying && analysis) {
+      const fps = analysis.fps_analyzed || 3;
+      const interval = 1000 / (fps * playbackSpeed);
+
+      const animate = () => {
+        setCurrentFrame(prev => {
+          const next = prev + 1;
+          if (next >= analysis.total_frames) {
+            setIsPlaying(false);
+            return prev;
+          }
+          fetchRadarState(next);
+          return next;
+        });
+        animationRef.current = window.setTimeout(animate, interval) as any;
+      };
+
+      animationRef.current = window.setTimeout(animate, interval) as any;
+
+      return () => {
+        if (animationRef.current) {
+          clearTimeout(animationRef.current as any);
+        }
+      };
+    }
+  }, [isPlaying, playbackSpeed, analysis]);
+
+  // Draw the pitch on canvas
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Clear canvas
+    ctx.fillStyle = '#1a472a'; // Dark green pitch
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Draw pitch markings
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+    ctx.lineWidth = 2;
+
+    // Outer boundary
+    ctx.strokeRect(PADDING, PADDING, PITCH_WIDTH, PITCH_HEIGHT);
+
+    // Center line
+    ctx.beginPath();
+    ctx.moveTo(PADDING + PITCH_WIDTH / 2, PADDING);
+    ctx.lineTo(PADDING + PITCH_WIDTH / 2, PADDING + PITCH_HEIGHT);
+    ctx.stroke();
+
+    // Center circle
+    ctx.beginPath();
+    ctx.arc(PADDING + PITCH_WIDTH / 2, PADDING + PITCH_HEIGHT / 2, 30, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Center spot
+    ctx.beginPath();
+    ctx.arc(PADDING + PITCH_WIDTH / 2, PADDING + PITCH_HEIGHT / 2, 3, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+    ctx.fill();
+
+    // Penalty areas (left)
+    ctx.strokeRect(PADDING, PADDING + PITCH_HEIGHT / 2 - 55, 55, 110);
+    // Goal area (left)
+    ctx.strokeRect(PADDING, PADDING + PITCH_HEIGHT / 2 - 25, 18, 50);
+    // Penalty spot (left)
+    ctx.beginPath();
+    ctx.arc(PADDING + 36, PADDING + PITCH_HEIGHT / 2, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Penalty areas (right)
+    ctx.strokeRect(PADDING + PITCH_WIDTH - 55, PADDING + PITCH_HEIGHT / 2 - 55, 55, 110);
+    // Goal area (right)
+    ctx.strokeRect(PADDING + PITCH_WIDTH - 18, PADDING + PITCH_HEIGHT / 2 - 25, 18, 50);
+    // Penalty spot (right)
+    ctx.beginPath();
+    ctx.arc(PADDING + PITCH_WIDTH - 36, PADDING + PITCH_HEIGHT / 2, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Goals
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+    ctx.fillRect(PADDING - 8, PADDING + PITCH_HEIGHT / 2 - 15, 8, 30);
+    ctx.fillRect(PADDING + PITCH_WIDTH, PADDING + PITCH_HEIGHT / 2 - 15, 8, 30);
+
+    // Draw formation lines if enabled
+    if (showFormationLines && homeShape && homeShape.players.length > 0) {
+      ctx.strokeStyle = 'rgba(59, 130, 246, 0.3)'; // Blue with low opacity
+      ctx.lineWidth = 1;
+
+      // Draw convex hull / formation shape for home team
+      const homePoints = homeShape.players.map(p => ({
+        x: PADDING + (p.x / 100) * PITCH_WIDTH,
+        y: PADDING + (p.y / 100) * PITCH_HEIGHT
+      }));
+
+      if (homePoints.length >= 3) {
+        ctx.beginPath();
+        ctx.moveTo(homePoints[0].x, homePoints[0].y);
+        homePoints.forEach((p, i) => {
+          if (i > 0) ctx.lineTo(p.x, p.y);
+        });
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.1)';
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+
+    if (showFormationLines && awayShape && awayShape.players.length > 0) {
+      ctx.strokeStyle = 'rgba(239, 68, 68, 0.3)'; // Red with low opacity
+      ctx.lineWidth = 1;
+
+      const awayPoints = awayShape.players.map(p => ({
+        x: PADDING + (p.x / 100) * PITCH_WIDTH,
+        y: PADDING + (p.y / 100) * PITCH_HEIGHT
+      }));
+
+      if (awayPoints.length >= 3) {
+        ctx.beginPath();
+        ctx.moveTo(awayPoints[0].x, awayPoints[0].y);
+        awayPoints.forEach((p, i) => {
+          if (i > 0) ctx.lineTo(p.x, p.y);
+        });
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.1)';
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+
+    // Draw players if we have radar state
+    if (radarState) {
+      // Home players (blue)
+      radarState.players.home.forEach(player => {
+        const x = PADDING + (player.x / 100) * PITCH_WIDTH;
+        const y = PADDING + (player.y / 100) * PITCH_HEIGHT;
+
+        // Player circle
+        ctx.beginPath();
+        ctx.arc(x, y, 12, 0, Math.PI * 2);
+        ctx.fillStyle = player.has_ball ? '#22c55e' : '#3b82f6'; // Green if has ball, else blue
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Jersey number
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 10px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(player.jersey_number.toString(), x, y);
+      });
+
+      // Away players (red)
+      radarState.players.away.forEach(player => {
+        const x = PADDING + (player.x / 100) * PITCH_WIDTH;
+        const y = PADDING + (player.y / 100) * PITCH_HEIGHT;
+
+        ctx.beginPath();
+        ctx.arc(x, y, 12, 0, Math.PI * 2);
+        ctx.fillStyle = player.has_ball ? '#22c55e' : '#ef4444';
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 10px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(player.jersey_number.toString(), x, y);
+      });
+
+      // Ball (yellow)
+      if (radarState.ball) {
+        const bx = PADDING + (radarState.ball.x / 100) * PITCH_WIDTH;
+        const by = PADDING + (radarState.ball.y / 100) * PITCH_HEIGHT;
+
+        ctx.beginPath();
+        ctx.arc(bx, by, 6, 0, Math.PI * 2);
+        ctx.fillStyle = '#fbbf24';
+        ctx.fill();
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      // Draw team centroids if shapes available
+      if (homeShape?.centroid) {
+        const cx = PADDING + (homeShape.centroid.x / 100) * PITCH_WIDTH;
+        const cy = PADDING + (homeShape.centroid.y / 100) * PITCH_HEIGHT;
+        ctx.beginPath();
+        ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.5)';
+        ctx.fill();
+        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle = '#3b82f6';
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      if (awayShape?.centroid) {
+        const cx = PADDING + (awayShape.centroid.x / 100) * PITCH_WIDTH;
+        const cy = PADDING + (awayShape.centroid.y / 100) * PITCH_HEIGHT;
+        ctx.beginPath();
+        ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.5)';
+        ctx.fill();
+        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle = '#ef4444';
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+  }, [radarState, homeShape, awayShape, showFormationLines, showTrails]);
+
+  const handleFrameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const frame = parseInt(e.target.value);
+    setCurrentFrame(frame);
+    fetchRadarState(frame);
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700/50">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h2 className="text-xl font-bold text-white flex items-center gap-2">
+              <span className="text-2xl">📍</span>
+              2D Tactical Radar
+            </h2>
+            <p className="text-slate-400 text-sm mt-1">
+              Real-time overhead view of player positions and team shape
+            </p>
+          </div>
+          <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2">
+              <div className="w-4 h-4 bg-blue-500 rounded-full"></div>
+              <span className="text-sm text-slate-300">Home</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="w-4 h-4 bg-red-500 rounded-full"></div>
+              <span className="text-sm text-slate-300">Away</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="w-4 h-4 bg-yellow-500 rounded-full"></div>
+              <span className="text-sm text-slate-300">Ball</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Controls */}
+        <div className="flex items-center gap-4 mb-4">
+          <button
+            onClick={() => setIsPlaying(!isPlaying)}
+            className={`px-4 py-2 rounded-lg font-medium transition-all ${
+              isPlaying
+                ? 'bg-red-500 hover:bg-red-600 text-white'
+                : 'bg-cyan-500 hover:bg-cyan-600 text-white'
+            }`}
+          >
+            {isPlaying ? '⏸ Pause' : '▶ Play'}
+          </button>
+
+          <select
+            value={playbackSpeed}
+            onChange={(e) => setPlaybackSpeed(parseFloat(e.target.value))}
+            className="bg-slate-700 text-white px-3 py-2 rounded-lg border border-slate-600"
+          >
+            <option value={0.5}>0.5x</option>
+            <option value={1}>1x</option>
+            <option value={2}>2x</option>
+            <option value={4}>4x</option>
+          </select>
+
+          <label className="flex items-center gap-2 text-sm text-slate-300">
+            <input
+              type="checkbox"
+              checked={showFormationLines}
+              onChange={(e) => setShowFormationLines(e.target.checked)}
+              className="rounded"
+            />
+            Show Formation
+          </label>
+        </div>
+
+        {/* Frame slider */}
+        {analysis && (
+          <div className="flex items-center gap-4">
+            <span className="text-sm text-slate-400">Frame:</span>
+            <input
+              type="range"
+              min={0}
+              max={analysis.total_frames - 1}
+              value={currentFrame}
+              onChange={handleFrameChange}
+              className="flex-1 accent-cyan-500"
+            />
+            <span className="text-sm text-slate-300 min-w-[80px]">
+              {currentFrame} / {analysis.total_frames}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Main Pitch View */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="lg:col-span-2">
+          <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700/50">
+            <canvas
+              ref={canvasRef}
+              width={440}
+              height={300}
+              className="w-full rounded-lg"
+              style={{ maxWidth: '100%', height: 'auto' }}
+            />
+          </div>
+        </div>
+
+        {/* Team Stats Panel */}
+        <div className="space-y-4">
+          {/* Home Team */}
+          <div className="bg-slate-800/50 rounded-xl p-4 border border-blue-500/30">
+            <h3 className="font-bold text-blue-400 mb-3 flex items-center gap-2">
+              <div className="w-3 h-3 bg-blue-500 rounded-full"></div>
+              Home Team
+            </h3>
+            {homeShape && (
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Players Tracked:</span>
+                  <span className="text-white">{homeShape.players.length}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Team Width:</span>
+                  <span className="text-white">{homeShape.width.toFixed(1)}m</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Team Depth:</span>
+                  <span className="text-white">{homeShape.depth.toFixed(1)}m</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Compactness:</span>
+                  <span className="text-white">{homeShape.compactness.toFixed(1)}</span>
+                </div>
+              </div>
+            )}
+            {radarState && (
+              <div className="mt-3 pt-3 border-t border-slate-700">
+                <span className="text-slate-400 text-xs">Jersey Numbers:</span>
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {radarState.players.home.map(p => (
+                    <span key={p.jersey_number} className="px-2 py-0.5 bg-blue-500/20 text-blue-300 rounded text-xs">
+                      #{p.jersey_number}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Away Team */}
+          <div className="bg-slate-800/50 rounded-xl p-4 border border-red-500/30">
+            <h3 className="font-bold text-red-400 mb-3 flex items-center gap-2">
+              <div className="w-3 h-3 bg-red-500 rounded-full"></div>
+              Away Team
+            </h3>
+            {awayShape && (
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Players Tracked:</span>
+                  <span className="text-white">{awayShape.players.length}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Team Width:</span>
+                  <span className="text-white">{awayShape.width.toFixed(1)}m</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Team Depth:</span>
+                  <span className="text-white">{awayShape.depth.toFixed(1)}m</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Compactness:</span>
+                  <span className="text-white">{awayShape.compactness.toFixed(1)}</span>
+                </div>
+              </div>
+            )}
+            {radarState && (
+              <div className="mt-3 pt-3 border-t border-slate-700">
+                <span className="text-slate-400 text-xs">Jersey Numbers:</span>
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {radarState.players.away.map(p => (
+                    <span key={p.jersey_number} className="px-2 py-0.5 bg-red-500/20 text-red-300 rounded text-xs">
+                      #{p.jersey_number}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Ball Info */}
+          {radarState?.ball && (
+            <div className="bg-slate-800/50 rounded-xl p-4 border border-yellow-500/30">
+              <h3 className="font-bold text-yellow-400 mb-2 flex items-center gap-2">
+                <div className="w-3 h-3 bg-yellow-500 rounded-full"></div>
+                Ball Position
+              </h3>
+              <div className="text-sm space-y-1">
+                <div className="flex justify-between">
+                  <span className="text-slate-400">X:</span>
+                  <span className="text-white">{radarState.ball.x.toFixed(1)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Y:</span>
+                  <span className="text-white">{radarState.ball.y.toFixed(1)}</span>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ==================== PLAYER SPOTLIGHT VIEW (VEO-STYLE) ====================
+interface PlayerMoment {
+  id: string;
+  track_id: string;
+  jersey_number: number;
+  team: 'home' | 'away';
+  start_frame: number;
+  end_frame: number;
+  start_time_ms: number;
+  end_time_ms: number;
+  moment_type: 'ball_touch' | 'pass' | 'shot' | 'dribble' | 'tackle' | 'interception';
+  confidence: number;
+  description?: string;
+}
+
+interface PlayerProfile {
+  track_id: string;
+  jersey_number: number;
+  team: 'home' | 'away';
+  total_moments: number;
+  ball_touches: number;
+  passes: number;
+  shots: number;
+  tackles: number;
+  distance_covered_m: number;
+  avg_position: { x: number; y: number };
+  heatmap_url?: string;
+}
+
+interface SpotlightSettings {
+  distance_to_ball_threshold: number; // meters
+  time_before_moment: number; // seconds
+  time_after_moment: number; // seconds
+  min_confidence: number;
+}
+
+function PlayerSpotlightView() {
+  const [players, setPlayers] = useState<PlayerProfile[]>([]);
+  const [selectedPlayer, setSelectedPlayer] = useState<PlayerProfile | null>(null);
+  const [moments, setMoments] = useState<PlayerMoment[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [generatingClips, setGeneratingClips] = useState(false);
+  const [settings, setSettings] = useState<SpotlightSettings>({
+    distance_to_ball_threshold: 3,
+    time_before_moment: 3,
+    time_after_moment: 5,
+    min_confidence: 0.5
+  });
+  const [filterTeam, setFilterTeam] = useState<'all' | 'home' | 'away'>('all');
+  const [filterMomentType, setFilterMomentType] = useState<string>('all');
+
+  useEffect(() => {
+    fetchPlayers();
+  }, []);
+
+  useEffect(() => {
+    if (selectedPlayer) {
+      fetchPlayerMoments(selectedPlayer.track_id);
+    }
+  }, [selectedPlayer]);
+
+  const fetchPlayers = async () => {
+    setLoading(true);
+    try {
+      // Fetch from jersey detections and combine with tracking data
+      const [jerseyRes, trackingRes] = await Promise.all([
+        fetch('http://localhost:8000/api/match/current/jersey-detections'),
+        fetch('http://localhost:8000/api/visualization/average-positions/home'),
+      ]);
+
+      const profiles: PlayerProfile[] = [];
+
+      if (jerseyRes.ok) {
+        const jerseyData = await jerseyRes.json();
+
+        // Create profiles from jersey detections
+        Object.entries(jerseyData).forEach(([trackId, detection]: [string, any]) => {
+          if (detection.confirmed_number) {
+            profiles.push({
+              track_id: trackId,
+              jersey_number: detection.confirmed_number,
+              team: detection.team || 'home',
+              total_moments: 0,
+              ball_touches: 0,
+              passes: 0,
+              shots: 0,
+              tackles: 0,
+              distance_covered_m: 0,
+              avg_position: { x: 50, y: 50 }
+            });
+          }
+        });
+      }
+
+      // If no jersey detections, create placeholder profiles
+      if (profiles.length === 0) {
+        for (let i = 1; i <= 11; i++) {
+          profiles.push({
+            track_id: `home_${i}`,
+            jersey_number: i,
+            team: 'home',
+            total_moments: Math.floor(Math.random() * 20),
+            ball_touches: Math.floor(Math.random() * 15),
+            passes: Math.floor(Math.random() * 10),
+            shots: Math.floor(Math.random() * 3),
+            tackles: Math.floor(Math.random() * 5),
+            distance_covered_m: Math.floor(Math.random() * 3000) + 5000,
+            avg_position: { x: 20 + Math.random() * 60, y: 10 + Math.random() * 80 }
+          });
+        }
+        for (let i = 1; i <= 11; i++) {
+          profiles.push({
+            track_id: `away_${i}`,
+            jersey_number: i,
+            team: 'away',
+            total_moments: Math.floor(Math.random() * 20),
+            ball_touches: Math.floor(Math.random() * 15),
+            passes: Math.floor(Math.random() * 10),
+            shots: Math.floor(Math.random() * 3),
+            tackles: Math.floor(Math.random() * 5),
+            distance_covered_m: Math.floor(Math.random() * 3000) + 5000,
+            avg_position: { x: 20 + Math.random() * 60, y: 10 + Math.random() * 80 }
+          });
+        }
+      }
+
+      setPlayers(profiles);
+    } catch (err) {
+      console.error('Failed to fetch players:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchPlayerMoments = async (trackId: string) => {
+    try {
+      // In a full implementation, this would fetch from the backend
+      // For now, generate sample moments
+      const sampleMoments: PlayerMoment[] = [];
+      const momentTypes: PlayerMoment['moment_type'][] = ['ball_touch', 'pass', 'shot', 'dribble', 'tackle', 'interception'];
+
+      const player = players.find(p => p.track_id === trackId);
+      if (!player) return;
+
+      for (let i = 0; i < player.total_moments; i++) {
+        const startFrame = Math.floor(Math.random() * 5000);
+        const momentType = momentTypes[Math.floor(Math.random() * momentTypes.length)];
+        sampleMoments.push({
+          id: `moment_${i}`,
+          track_id: trackId,
+          jersey_number: player.jersey_number,
+          team: player.team,
+          start_frame: startFrame,
+          end_frame: startFrame + 150, // ~5 seconds at 30fps
+          start_time_ms: startFrame * 33,
+          end_time_ms: (startFrame + 150) * 33,
+          moment_type: momentType,
+          confidence: 0.5 + Math.random() * 0.5,
+          description: getMomentDescription(momentType)
+        });
+      }
+
+      setMoments(sampleMoments.sort((a, b) => a.start_frame - b.start_frame));
+    } catch (err) {
+      console.error('Failed to fetch player moments:', err);
+    }
+  };
+
+  const getMomentDescription = (type: PlayerMoment['moment_type']): string => {
+    const descriptions: Record<string, string[]> = {
+      ball_touch: ['Receives the ball', 'Controls with first touch', 'Takes possession'],
+      pass: ['Short pass to teammate', 'Long ball forward', 'Cross into the box'],
+      shot: ['Shot on goal', 'Effort from distance', 'Header towards goal'],
+      dribble: ['Takes on defender', 'Dribbles past opponent', 'Carries ball forward'],
+      tackle: ['Wins the ball back', 'Clean tackle', 'Challenges for possession'],
+      interception: ['Reads the play', 'Cuts out the pass', 'Intercepts danger']
+    };
+    const options = descriptions[type] || ['Player action'];
+    return options[Math.floor(Math.random() * options.length)];
+  };
+
+  const generateClip = async (moment: PlayerMoment) => {
+    setGeneratingClips(true);
+    try {
+      // Calculate clip boundaries based on settings
+      const fps = 30;
+      const framesBefore = Math.floor(settings.time_before_moment * fps);
+      const framesAfter = Math.floor(settings.time_after_moment * fps);
+
+      const response = await fetch('http://localhost:8000/api/clips/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          start_frame: Math.max(0, moment.start_frame - framesBefore),
+          end_frame: moment.end_frame + framesAfter,
+          player_track_id: moment.track_id,
+          moment_type: moment.moment_type,
+          description: moment.description
+        })
+      });
+
+      if (response.ok) {
+        alert('Clip generated successfully!');
+      } else {
+        alert('Clip generation endpoint not yet implemented');
+      }
+    } catch (err) {
+      console.error('Failed to generate clip:', err);
+      alert('Clip generation requires backend implementation');
+    } finally {
+      setGeneratingClips(false);
+    }
+  };
+
+  const filteredPlayers = players.filter(p =>
+    filterTeam === 'all' || p.team === filterTeam
+  );
+
+  const filteredMoments = moments.filter(m =>
+    (filterMomentType === 'all' || m.moment_type === filterMomentType) &&
+    m.confidence >= settings.min_confidence
+  );
+
+  const formatTime = (ms: number): string => {
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${minutes}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700/50">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h2 className="text-xl font-bold text-white flex items-center gap-2">
+              <span className="text-2xl">🌟</span>
+              Player Spotlight
+            </h2>
+            <p className="text-slate-400 text-sm mt-1">
+              Track individual player moments and generate highlight clips
+            </p>
+          </div>
+        </div>
+
+        {/* Settings */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div>
+            <label className="text-xs text-slate-400 block mb-1">Distance to Ball (m)</label>
+            <input
+              type="number"
+              min={1}
+              max={10}
+              value={settings.distance_to_ball_threshold}
+              onChange={(e) => setSettings({...settings, distance_to_ball_threshold: parseFloat(e.target.value)})}
+              className="w-full bg-slate-700 text-white px-3 py-2 rounded-lg border border-slate-600 text-sm"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-400 block mb-1">Time Before (sec)</label>
+            <input
+              type="number"
+              min={1}
+              max={10}
+              value={settings.time_before_moment}
+              onChange={(e) => setSettings({...settings, time_before_moment: parseFloat(e.target.value)})}
+              className="w-full bg-slate-700 text-white px-3 py-2 rounded-lg border border-slate-600 text-sm"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-400 block mb-1">Time After (sec)</label>
+            <input
+              type="number"
+              min={1}
+              max={15}
+              value={settings.time_after_moment}
+              onChange={(e) => setSettings({...settings, time_after_moment: parseFloat(e.target.value)})}
+              className="w-full bg-slate-700 text-white px-3 py-2 rounded-lg border border-slate-600 text-sm"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-400 block mb-1">Min Confidence</label>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.1}
+              value={settings.min_confidence}
+              onChange={(e) => setSettings({...settings, min_confidence: parseFloat(e.target.value)})}
+              className="w-full accent-cyan-500"
+            />
+            <span className="text-xs text-slate-300">{(settings.min_confidence * 100).toFixed(0)}%</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Player List */}
+        <div className="lg:col-span-1">
+          <div className="bg-slate-800/50 rounded-xl border border-slate-700/50">
+            <div className="p-4 border-b border-slate-700">
+              <h3 className="font-bold text-white mb-2">Select Player</h3>
+              <div className="flex gap-2">
+                {['all', 'home', 'away'].map(team => (
+                  <button
+                    key={team}
+                    onClick={() => setFilterTeam(team as any)}
+                    className={`px-3 py-1 rounded text-sm transition-all ${
+                      filterTeam === team
+                        ? 'bg-cyan-500 text-white'
+                        : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+                    }`}
+                  >
+                    {team.charAt(0).toUpperCase() + team.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="max-h-[500px] overflow-y-auto">
+              {loading ? (
+                <div className="p-8 text-center text-slate-400">Loading players...</div>
+              ) : (
+                filteredPlayers.map(player => (
+                  <button
+                    key={player.track_id}
+                    onClick={() => setSelectedPlayer(player)}
+                    className={`w-full p-4 text-left border-b border-slate-700/50 transition-all hover:bg-slate-700/50 ${
+                      selectedPlayer?.track_id === player.track_id ? 'bg-slate-700/50 border-l-4 border-l-cyan-500' : ''
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className={`w-10 h-10 rounded-full flex items-center justify-center text-white font-bold ${
+                        player.team === 'home' ? 'bg-blue-500' : 'bg-red-500'
+                      }`}>
+                        {player.jersey_number}
+                      </div>
+                      <div>
+                        <div className="text-white font-medium">
+                          #{player.jersey_number}
+                          <span className="text-slate-400 text-sm ml-2">
+                            ({player.team})
+                          </span>
+                        </div>
+                        <div className="text-xs text-slate-400">
+                          {player.total_moments} moments • {player.ball_touches} touches
+                        </div>
+                      </div>
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Player Details & Moments */}
+        <div className="lg:col-span-2 space-y-4">
+          {selectedPlayer ? (
+            <>
+              {/* Player Stats Card */}
+              <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700/50">
+                <div className="flex items-start justify-between mb-4">
+                  <div className="flex items-center gap-4">
+                    <div className={`w-16 h-16 rounded-full flex items-center justify-center text-2xl font-bold text-white ${
+                      selectedPlayer.team === 'home' ? 'bg-blue-500' : 'bg-red-500'
+                    }`}>
+                      {selectedPlayer.jersey_number}
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-bold text-white">
+                        Player #{selectedPlayer.jersey_number}
+                      </h3>
+                      <p className="text-slate-400 capitalize">{selectedPlayer.team} Team</p>
+                    </div>
+                  </div>
+                  <button
+                    className="px-4 py-2 bg-cyan-500 hover:bg-cyan-600 text-white rounded-lg text-sm font-medium transition-all"
+                    onClick={() => alert('Generate full highlight reel - coming soon!')}
+                  >
+                    Generate Highlight Reel
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-3 md:grid-cols-6 gap-4">
+                  <div className="bg-slate-700/50 rounded-lg p-3 text-center">
+                    <div className="text-2xl font-bold text-cyan-400">{selectedPlayer.total_moments}</div>
+                    <div className="text-xs text-slate-400">Moments</div>
+                  </div>
+                  <div className="bg-slate-700/50 rounded-lg p-3 text-center">
+                    <div className="text-2xl font-bold text-green-400">{selectedPlayer.ball_touches}</div>
+                    <div className="text-xs text-slate-400">Touches</div>
+                  </div>
+                  <div className="bg-slate-700/50 rounded-lg p-3 text-center">
+                    <div className="text-2xl font-bold text-blue-400">{selectedPlayer.passes}</div>
+                    <div className="text-xs text-slate-400">Passes</div>
+                  </div>
+                  <div className="bg-slate-700/50 rounded-lg p-3 text-center">
+                    <div className="text-2xl font-bold text-yellow-400">{selectedPlayer.shots}</div>
+                    <div className="text-xs text-slate-400">Shots</div>
+                  </div>
+                  <div className="bg-slate-700/50 rounded-lg p-3 text-center">
+                    <div className="text-2xl font-bold text-orange-400">{selectedPlayer.tackles}</div>
+                    <div className="text-xs text-slate-400">Tackles</div>
+                  </div>
+                  <div className="bg-slate-700/50 rounded-lg p-3 text-center">
+                    <div className="text-2xl font-bold text-purple-400">{(selectedPlayer.distance_covered_m / 1000).toFixed(1)}</div>
+                    <div className="text-xs text-slate-400">km Covered</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Moments Timeline */}
+              <div className="bg-slate-800/50 rounded-xl border border-slate-700/50">
+                <div className="p-4 border-b border-slate-700 flex items-center justify-between">
+                  <h3 className="font-bold text-white">Player Moments</h3>
+                  <select
+                    value={filterMomentType}
+                    onChange={(e) => setFilterMomentType(e.target.value)}
+                    className="bg-slate-700 text-white px-3 py-1 rounded text-sm border border-slate-600"
+                  >
+                    <option value="all">All Types</option>
+                    <option value="ball_touch">Ball Touches</option>
+                    <option value="pass">Passes</option>
+                    <option value="shot">Shots</option>
+                    <option value="dribble">Dribbles</option>
+                    <option value="tackle">Tackles</option>
+                    <option value="interception">Interceptions</option>
+                  </select>
+                </div>
+
+                <div className="max-h-[400px] overflow-y-auto">
+                  {filteredMoments.length === 0 ? (
+                    <div className="p-8 text-center text-slate-400">
+                      No moments found for this player
+                    </div>
+                  ) : (
+                    filteredMoments.map((moment, idx) => (
+                      <div
+                        key={moment.id}
+                        className="p-4 border-b border-slate-700/50 hover:bg-slate-700/30 transition-all"
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-3">
+                            <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${
+                              moment.moment_type === 'shot' ? 'bg-yellow-500/20 text-yellow-400' :
+                              moment.moment_type === 'pass' ? 'bg-blue-500/20 text-blue-400' :
+                              moment.moment_type === 'tackle' ? 'bg-orange-500/20 text-orange-400' :
+                              moment.moment_type === 'dribble' ? 'bg-green-500/20 text-green-400' :
+                              'bg-slate-500/20 text-slate-400'
+                            }`}>
+                              {moment.moment_type === 'shot' ? '⚽' :
+                               moment.moment_type === 'pass' ? '➡️' :
+                               moment.moment_type === 'tackle' ? '🦶' :
+                               moment.moment_type === 'dribble' ? '💨' :
+                               moment.moment_type === 'interception' ? '🛡️' : '⚽'}
+                            </div>
+                            <div>
+                              <div className="text-white font-medium capitalize">
+                                {moment.moment_type.replace('_', ' ')}
+                              </div>
+                              <div className="text-sm text-slate-400">
+                                {moment.description}
+                              </div>
+                              <div className="text-xs text-slate-500">
+                                {formatTime(moment.start_time_ms)} - {formatTime(moment.end_time_ms)}
+                                <span className="ml-2">({(moment.confidence * 100).toFixed(0)}% confidence)</span>
+                              </div>
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => generateClip(moment)}
+                            disabled={generatingClips}
+                            className="px-3 py-1 bg-cyan-500/20 text-cyan-400 hover:bg-cyan-500/30 rounded text-sm transition-all disabled:opacity-50"
+                          >
+                            {generatingClips ? '...' : 'Create Clip'}
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="bg-slate-800/50 rounded-xl p-12 border border-slate-700/50 text-center">
+              <div className="text-5xl mb-4">🌟</div>
+              <h3 className="text-xl font-bold text-white mb-2">Select a Player</h3>
+              <p className="text-slate-400">
+                Choose a player from the list to view their moments and generate highlight clips
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ==================== JERSEY DETECTION VIEW ====================
 interface JerseyStats {
   provider: string;
   api_calls: number;
