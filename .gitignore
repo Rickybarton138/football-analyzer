@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.env
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data files
+data/uploads/*
+data/frames/*
+data/models/*
+data/training/*
+!data/uploads/.gitkeep
+!data/frames/.gitkeep
+!data/models/.gitkeep
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs
+frontend/dist/
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Temporary files
+*.tmp
+*.temp
+
+# ML Models (large files)
+*.pt
+*.pth
+*.onnx
+
+# Uploads folder
+backend/uploads/
+
+# Audio temp files
+*.m4a
+
+# Windows null device
+nul
