@@ -132,7 +132,7 @@ class DetectionService:
             all_detections = []
 
             # Adjust confidence based on retry (lower each time)
-            retry_factor = 1.0 - (retry * 0.3)  # 1.0, 0.7, 0.4
+            retry_factor = 1.0 - (retry * settings.DETECTION_RETRY_DECAY)  # e.g. 1.0, 0.8, 0.6
 
             # Multi-scale detection for better coverage of distant players
             scales_to_use = self.detection_scales if self.use_multi_scale else [1.0]
@@ -146,7 +146,7 @@ class DetectionService:
                     conf_thresh = self.low_confidence_thresh * retry_factor
                 else:
                     # Heavily downscaled - use very low confidence
-                    conf_thresh = max(0.05, self.low_confidence_thresh * 0.5 * retry_factor)
+                    conf_thresh = max(settings.DETECTION_MIN_CONFIDENCE_FLOOR, self.low_confidence_thresh * 0.5 * retry_factor)
 
                 # Resize frame
                 if scale != 1.0:
@@ -198,8 +198,8 @@ class DetectionService:
                             continue  # Too large (probably not a player)
 
                         aspect_ratio = box_height / max(box_width, 1)
-                        if aspect_ratio < 0.5 or aspect_ratio > 5.0:
-                            continue  # Unreasonable aspect ratio
+                        if aspect_ratio < settings.DETECTION_ASPECT_RATIO_MIN or aspect_ratio > settings.DETECTION_ASPECT_RATIO_MAX:
+                            continue  # Unreasonable aspect ratio for a human
 
                         confidence = float(box.conf[0])
 
@@ -232,11 +232,22 @@ class DetectionService:
             confidence = det['confidence']
 
             # Extract jersey color for team classification
-            player_roi = frame[y1:y2, x1:x2]
-            jersey_color = self._extract_jersey_color(player_roi)
+            # Skip color extraction for tiny boxes — too few pixels for reliable color
+            box_area = (x2 - x1) * (y2 - y1)
+            if box_area < settings.DETECTION_MIN_BOX_AREA:
+                jersey_color = None
+            else:
+                player_roi = frame[y1:y2, x1:x2]
+                jersey_color = self._extract_jersey_color(player_roi)
 
-            # Classify team
-            team = self._classify_team(jersey_color)
+            # Filter referee/linesman before team classification
+            is_referee = self._is_referee(jersey_color)
+
+            # Classify team (referee gets UNKNOWN)
+            if is_referee:
+                team = TeamSide.UNKNOWN
+            else:
+                team = self._classify_team(jersey_color)
 
             # Check if goalkeeper
             is_gk = self._is_goalkeeper(jersey_color, x1, x2, frame.shape[1])
@@ -426,15 +437,20 @@ class DetectionService:
         # Reshape pixels
         pixels = torso.reshape(-1, 3)
 
-        # Filter out grass-like colors (green dominant pixels)
-        # Grass typically has G > R and G > B with moderate saturation
+        # Filter out grass-like colors using HSV (lighting-invariant)
+        # Convert pixels to HSV for robust grass detection
+        pixels_bgr = pixels.reshape(-1, 1, 3).astype(np.uint8)
+        pixels_hsv = cv2.cvtColor(pixels_bgr, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+
         filtered_pixels = []
-        for pixel in pixels:
-            b, g, r = pixel  # OpenCV uses BGR
-            # Skip grass-like pixels: green is dominant and significantly higher than others
-            is_grass = (g > r * 1.2 and g > b * 1.1 and g > 40 and g < 180)
+        for i, pixel in enumerate(pixels):
+            h, s, v = pixels_hsv[i]
+            b, g, r = pixel
+
+            # Grass detection via HSV: green hue range 35-85 is lighting-invariant
+            is_grass = (35 <= h <= 85 and s > 30 and v > 30)
             # Also skip very dark pixels (shadows) and very bright pixels (sky/lines)
-            is_dark = (r < 30 and g < 30 and b < 30)
+            is_dark = (v < 30)
             is_bright = (r > 220 and g > 220 and b > 220)
             if not is_grass and not is_dark and not is_bright:
                 filtered_pixels.append(pixel)
@@ -445,44 +461,126 @@ class DetectionService:
 
         pixels = np.array(filtered_pixels)
 
-        # Use K-means to find dominant color
+        # Use K-means to find dominant jersey color
         try:
-            # Use 2 clusters to separate jersey from remaining noise
-            n_clusters = min(2, len(pixels))
+            # Use 3 clusters to separate jersey from skin and remaining noise
+            n_clusters = min(3, len(pixels))
             if n_clusters < 1:
                 return None
 
             kmeans = KMeans(n_clusters=n_clusters, n_init=5, max_iter=100, random_state=42)
             kmeans.fit(pixels)
 
-            # Get the cluster with more pixels (usually jersey, not skin)
             labels, counts = np.unique(kmeans.labels_, return_counts=True)
-            dominant_idx = labels[np.argmax(counts)]
-            dominant_color = kmeans.cluster_centers_[dominant_idx]
 
-            return dominant_color.astype(np.uint8)
+            # Score each cluster: larger clusters win, but penalize skin-like and grass-like colors
+            best_score = -1
+            best_color = None
+
+            for idx in range(n_clusters):
+                center = kmeans.cluster_centers_[idx]
+                cluster_size = counts[labels == idx][0] if idx in labels else 0
+
+                # Convert cluster center to HSV for penalty checks
+                center_bgr = center.astype(np.uint8).reshape(1, 1, 3)
+                center_hsv = cv2.cvtColor(center_bgr, cv2.COLOR_BGR2HSV).reshape(3)
+                h, s, v = center_hsv
+
+                score = float(cluster_size)
+
+                # Penalize skin-like colors (HSV hue 0-25, moderate saturation)
+                if h <= 25 and 30 < s < 170 and v > 60:
+                    score *= 0.3
+
+                # Penalize grass-like colors (HSV hue 35-85)
+                if 35 <= h <= 85 and s > 30 and v > 30:
+                    score *= 0.2
+
+                if score > best_score:
+                    best_score = score
+                    best_color = center
+
+            if best_color is not None:
+                return best_color.astype(np.uint8)
+            return None
         except Exception:
             # Fallback to mean color
             return np.mean(pixels, axis=0).astype(np.uint8)
 
+    def _bgr_to_lab(self, bgr_color: np.ndarray) -> np.ndarray:
+        """Convert a single BGR color to CIELAB."""
+        bgr_pixel = bgr_color.astype(np.uint8).reshape(1, 1, 3)
+        lab_pixel = cv2.cvtColor(bgr_pixel, cv2.COLOR_BGR2LAB)
+        return lab_pixel.reshape(3).astype(float)
+
     def _classify_team(self, jersey_color: Optional[np.ndarray]) -> TeamSide:
-        """Classify team based on jersey color."""
+        """Classify team based on jersey color using CIELAB distance."""
         if jersey_color is None:
             return TeamSide.UNKNOWN
 
         if self.home_color is None or self.away_color is None:
             return TeamSide.UNKNOWN
 
-        # Calculate color distance to each team
-        home_dist = np.linalg.norm(jersey_color.astype(float) - self.home_color.astype(float))
-        away_dist = np.linalg.norm(jersey_color.astype(float) - self.away_color.astype(float))
+        # Convert all colors to LAB for perceptually uniform distance
+        color_lab = self._bgr_to_lab(jersey_color)
+        home_lab = self._bgr_to_lab(self.home_color)
+        away_lab = self._bgr_to_lab(self.away_color)
 
-        # Use threshold to avoid misclassification
+        home_dist = np.linalg.norm(color_lab - home_lab)
+        away_dist = np.linalg.norm(color_lab - away_lab)
+
         min_dist = min(home_dist, away_dist)
-        if min_dist > 100:  # Too different from both, might be referee
+        max_dist = max(home_dist, away_dist)
+
+        # Referee threshold: too far from both teams in LAB space
+        if min_dist > settings.TEAM_COLOR_DISTANCE_THRESHOLD:
+            return TeamSide.UNKNOWN
+
+        # Ambiguity check: colors too similar to both teams
+        if max_dist > 0 and min_dist / max_dist > settings.TEAM_AMBIGUITY_RATIO:
             return TeamSide.UNKNOWN
 
         return TeamSide.HOME if home_dist < away_dist else TeamSide.AWAY
+
+    def _is_referee(self, jersey_color: Optional[np.ndarray]) -> bool:
+        """
+        Detect referee/linesman by jersey color characteristics.
+
+        Referees typically wear black kits (low V, low S), yellow kits (hue 25-35),
+        or fluorescent green. Also requires color distance > 60 LAB from both team colors.
+        """
+        if jersey_color is None:
+            return False
+
+        # Convert to HSV for hue-based checks
+        bgr_pixel = jersey_color.astype(np.uint8).reshape(1, 1, 3)
+        hsv_pixel = cv2.cvtColor(bgr_pixel, cv2.COLOR_BGR2HSV).reshape(3)
+        h, s, v = hsv_pixel
+
+        # Black kit: low value, low saturation
+        is_black_kit = (v < 60 and s < 80)
+        # Yellow kit: hue 25-35, high saturation
+        is_yellow_kit = (25 <= h <= 35 and s > 100 and v > 100)
+        # Fluorescent green: hue 35-75, very high saturation and value
+        is_fluoro_green = (35 <= h <= 75 and s > 150 and v > 150)
+
+        if not (is_black_kit or is_yellow_kit or is_fluoro_green):
+            return False
+
+        # Confirm: must be distant from both team colors in LAB space
+        if self.home_color is not None and self.away_color is not None:
+            color_lab = self._bgr_to_lab(jersey_color)
+            home_lab = self._bgr_to_lab(self.home_color)
+            away_lab = self._bgr_to_lab(self.away_color)
+
+            home_dist = np.linalg.norm(color_lab - home_lab)
+            away_dist = np.linalg.norm(color_lab - away_lab)
+
+            # Must be distant from both teams
+            if home_dist > 60 and away_dist > 60:
+                return True
+
+        return False
 
     def _is_goalkeeper(
         self,
@@ -494,9 +592,9 @@ class DetectionService:
         """
         Determine if player is a goalkeeper.
 
-        Based on:
+        Requires BOTH position evidence AND color distinctness:
         1. Position near goal (edge of frame)
-        2. Distinct jersey color from field players
+        2. Distinct jersey color from own team's field players (distance > 60 LAB)
         """
         if jersey_color is None:
             return False
@@ -512,11 +610,27 @@ class DetectionService:
         # Check if color is distinct from team colors
         if self.goalkeeper_colors:
             for gk_color in self.goalkeeper_colors:
-                dist = np.linalg.norm(jersey_color.astype(float) - gk_color.astype(float))
+                gk_lab = self._bgr_to_lab(gk_color)
+                color_lab = self._bgr_to_lab(jersey_color)
+                dist = np.linalg.norm(color_lab - gk_lab)
                 if dist < 50:
                     return True
 
-        return near_left or near_right
+        # Must also be color-distinct from own team to confirm GK
+        # A near-edge player wearing the same color as field players is not a GK
+        color_distinct = False
+        if self.home_color is not None and self.away_color is not None:
+            color_lab = self._bgr_to_lab(jersey_color)
+            home_lab = self._bgr_to_lab(self.home_color)
+            away_lab = self._bgr_to_lab(self.away_color)
+
+            home_dist = np.linalg.norm(color_lab - home_lab)
+            away_dist = np.linalg.norm(color_lab - away_lab)
+
+            # GK should be distinct from at least one team (their own)
+            color_distinct = home_dist > 60 or away_dist > 60
+
+        return color_distinct
 
     async def set_team_colors(
         self,

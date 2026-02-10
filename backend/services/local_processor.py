@@ -20,6 +20,7 @@ from models.schemas import DetectedPlayer, BoundingBox, PixelPosition, TeamSide
 from services.player_highlights import player_highlights_service
 from services.jersey_ocr import jersey_ocr_service
 from services.ai_jersey_detection import ai_jersey_detection_service
+from services.tracking import TrackingService
 from config import settings
 
 # Import professional analytics services (VEO-style)
@@ -301,8 +302,9 @@ class LocalVideoProcessor:
         self.current_analysis: Optional[MatchAnalysis] = None
         self.model = None
         self.ball_tracker = BallTracker()
+        self.tracking_service = TrackingService()  # Real multi-object tracker
         self.use_multi_scale = False  # Disable for faster processing (set True for better detection)
-        self.track_counter = 0  # For assigning track IDs
+        self.track_counter = 0  # Legacy fallback counter
 
     def _determine_ball_possession(
         self,
@@ -474,9 +476,15 @@ class LocalVideoProcessor:
                     y2 = max(0, min(y2, height))
 
                     bbox_height = y2 - y1
+                    bbox_width = x2 - x1
 
                     # Class 0 = person
                     if cls == 0:
+                        # Aspect ratio filter — humans never exceed ~3:1 H/W
+                        if bbox_width > 0 and bbox_height > 0:
+                            aspect_ratio = bbox_height / bbox_width
+                            if aspect_ratio < settings.DETECTION_ASPECT_RATIO_MIN or aspect_ratio > settings.DETECTION_ASPECT_RATIO_MAX:
+                                continue
                         # Apply adaptive confidence based on player size
                         required_conf = self._get_adaptive_confidence(bbox_height, height)
                         if conf >= required_conf:
@@ -601,6 +609,7 @@ class LocalVideoProcessor:
             total_frames=total_frames
         )
         self.track_counter = 0  # Reset track counter for new video
+        self.tracking_service.reset()  # Reset tracker for new video
 
         # Initialize professional analytics services (VEO-style)
         match_statistics_service.reset()
@@ -678,16 +687,12 @@ class LocalVideoProcessor:
                     # Use enhanced multi-scale detection
                     player_detections, yolo_ball_pos = self._detect_players_multiscale(frame, model)
 
-                    # Process each detected player
+                    # Convert raw detections to DetectedPlayer objects for the tracker
+                    raw_detected_players = []
                     for det in player_detections:
                         bbox = det['bbox']
                         conf = det['confidence']
                         player_boxes.append(bbox)
-
-                        # Assign track ID (simple incrementing for now)
-                        track_id = self.track_counter
-                        self.track_counter += 1
-                        det['track_id'] = track_id
 
                         # Classify team by jersey color
                         team = self._detect_team_color(frame, bbox)
@@ -695,9 +700,38 @@ class LocalVideoProcessor:
                             TeamSide.AWAY if team == 'away' else TeamSide.UNKNOWN
                         )
 
+                        raw_player = DetectedPlayer(
+                            track_id=-1,  # Will be assigned by tracker
+                            bbox=BoundingBox(
+                                x1=int(bbox[0]), y1=int(bbox[1]),
+                                x2=int(bbox[2]), y2=int(bbox[3]),
+                                confidence=conf
+                            ),
+                            pixel_position=PixelPosition(
+                                x=int((bbox[0] + bbox[2]) / 2),
+                                y=int((bbox[1] + bbox[3]) / 2)
+                            ),
+                            team=team_side,
+                        )
+                        raw_detected_players.append(raw_player)
+
+                    # Run real tracking to get consistent IDs across frames
+                    tracked_players = await self.tracking_service.update(
+                        raw_detected_players, frame_count
+                    )
+
+                    # Process tracked players with persistent IDs
+                    for tracked_player in tracked_players:
+                        track_id = tracked_player.track_id
+                        team_side = tracked_player.team
+                        team = 'home' if team_side == TeamSide.HOME else (
+                            'away' if team_side == TeamSide.AWAY else 'unknown'
+                        )
+
                         detection = Detection(
-                            bbox=bbox,
-                            confidence=conf,
+                            bbox=[tracked_player.bbox.x1, tracked_player.bbox.y1,
+                                  tracked_player.bbox.x2, tracked_player.bbox.y2],
+                            confidence=tracked_player.bbox.confidence,
                             class_id=0,
                             class_name='person',
                             team=team,
@@ -710,25 +744,32 @@ class LocalVideoProcessor:
                         elif team == 'away':
                             frame_analysis.away_players += 1
 
-                        # Create DetectedPlayer for highlights tracking
                         # Check if we already know this player's jersey number from OCR
                         known_jersey = jersey_ocr_service.get_jersey_number(track_id)
 
                         detected_player = DetectedPlayer(
                             track_id=track_id,
-                            bbox=BoundingBox(
-                                x1=int(bbox[0]), y1=int(bbox[1]),
-                                x2=int(bbox[2]), y2=int(bbox[3]),
-                                confidence=conf
-                            ),
-                            pixel_position=PixelPosition(
-                                x=int((bbox[0] + bbox[2]) / 2),
-                                y=int((bbox[1] + bbox[3]) / 2)
-                            ),
+                            bbox=tracked_player.bbox,
+                            pixel_position=tracked_player.pixel_position,
                             team=team_side,
-                            jersey_number=known_jersey  # From OCR if identified
+                            jersey_color=tracked_player.jersey_color,
+                            is_goalkeeper=tracked_player.is_goalkeeper,
+                            jersey_number=known_jersey
                         )
                         detected_players_for_highlights.append(detected_player)
+
+                    # Update player_detections for downstream ball possession code
+                    player_detections = [
+                        {
+                            'bbox': [p.bbox.x1, p.bbox.y1, p.bbox.x2, p.bbox.y2],
+                            'confidence': p.bbox.confidence,
+                            'track_id': p.track_id,
+                            'team': 'home' if p.team == TeamSide.HOME else (
+                                'away' if p.team == TeamSide.AWAY else 'unknown'
+                            )
+                        }
+                        for p in tracked_players
+                    ]
 
                 # Run jersey number detection
                 # AI jersey detection is preferred (more accurate), falls back to OCR

@@ -14,6 +14,7 @@ from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 from enum import Enum
 import math
+from scipy.optimize import linear_sum_assignment
 
 
 class PlayerState(Enum):
@@ -480,7 +481,7 @@ class PredictiveTracker:
     def _match_detections(self, detections: List[Dict],
                           frame_num: int) -> Tuple[List, List, List]:
         """
-        Match detections to existing trackers using Hungarian algorithm approximation.
+        Match detections to existing trackers using Hungarian algorithm.
 
         Returns:
             (matched_pairs, unmatched_detections, unmatched_tracker_ids)
@@ -513,21 +514,14 @@ class PredictiveTracker:
 
                 costs[i, j] = dist
 
-        # Greedy matching (simpler than Hungarian, works well for football)
+        # Hungarian algorithm for optimal assignment
+        row_indices, col_indices = linear_sum_assignment(costs)
+
         matched = []
         used_dets = set()
         used_tracks = set()
 
-        # Sort by cost and match greedily
-        flat_indices = np.argsort(costs.flatten())
-
-        for idx in flat_indices:
-            i = idx // len(track_ids)
-            j = idx % len(track_ids)
-
-            if i in used_dets or j in used_tracks:
-                continue
-
+        for i, j in zip(row_indices, col_indices):
             if costs[i, j] < self.max_distance_for_match:
                 matched.append((track_ids[j], detections[i]))
                 used_dets.add(i)

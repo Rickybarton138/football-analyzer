@@ -101,17 +101,34 @@ def detect_team_colors(detections, sample_frames=100):
 
     return home_color, away_color
 
+def _bgr_to_lab(bgr_color):
+    """Convert a single BGR color to CIELAB."""
+    import cv2
+    bgr_pixel = np.array(bgr_color, dtype=np.uint8).reshape(1, 1, 3)
+    lab_pixel = cv2.cvtColor(bgr_pixel, cv2.COLOR_BGR2LAB)
+    return lab_pixel.reshape(3).astype(float)
+
 def classify_team(jersey_color, home_color, away_color):
-    """Classify player team based on jersey color."""
+    """Classify player team based on jersey color using CIELAB distance."""
     if jersey_color is None or home_color is None or away_color is None:
         return 'unknown'
 
-    color = np.array(jersey_color)
-    home_dist = np.linalg.norm(color - home_color)
-    away_dist = np.linalg.norm(color - away_color)
+    color_lab = _bgr_to_lab(jersey_color)
+    home_lab = _bgr_to_lab(home_color)
+    away_lab = _bgr_to_lab(away_color)
+
+    home_dist = np.linalg.norm(color_lab - home_lab)
+    away_dist = np.linalg.norm(color_lab - away_lab)
 
     min_dist = min(home_dist, away_dist)
-    if min_dist > 100:  # Too far from both teams
+    max_dist = max(home_dist, away_dist)
+
+    # Too far from both teams in LAB space
+    if min_dist > 40:
+        return 'unknown'
+
+    # Colors too ambiguous between teams
+    if max_dist > 0 and min_dist / max_dist > 0.85:
         return 'unknown'
 
     return 'home' if home_dist < away_dist else 'away'
@@ -204,8 +221,8 @@ def fix_detection_file(input_path, output_path, grid_size=60, min_confidence=0.4
             else:
                 unknown_count += 1
 
-        # Balance teams to target 11 vs 11 (or close to it)
-        # Keep highest confidence players for each team
+        # Instead of force-balancing teams (which corrupts color-based classification),
+        # mark low-confidence excess players as unknown
         home_players = [p for p in deduped_players if p.get('team') == 'home']
         away_players = [p for p in deduped_players if p.get('team') == 'away']
         unknown_players = [p for p in deduped_players if p.get('team') == 'unknown']
@@ -214,39 +231,24 @@ def fix_detection_file(input_path, output_path, grid_size=60, min_confidence=0.4
         home_players.sort(key=lambda p: p.get('confidence', 0), reverse=True)
         away_players.sort(key=lambda p: p.get('confidence', 0), reverse=True)
 
-        # Target 11 players per team (actual players on pitch)
-        # Allow up to 12 to account for substitutions
+        # Cap each team at max_per_team, but mark excess as unknown instead of
+        # force-reassigning to the opposite team
         max_per_team = 12
 
-        # If one team has way more than the other, it's likely misclassified
-        # Re-assign excess players to the other team if they're close in color
-        if home_count > max_per_team and away_count < 11:
-            # Take excess home players and check if they should be away
-            excess_home = home_players[max_per_team:]
-            for p in excess_home:
-                if away_count < 11:
-                    # Re-classify this player as away
-                    p['team'] = 'away'
-                    away_players.append(p)
-                    away_count += 1
+        if len(home_players) > max_per_team:
+            excess = home_players[max_per_team:]
+            for p in excess:
+                p['team'] = 'unknown'
+            unknown_players.extend(excess)
             home_players = home_players[:max_per_team]
-            home_count = len(home_players)
 
-        if away_count > max_per_team and home_count < 11:
-            # Take excess away players and check if they should be home
-            excess_away = away_players[max_per_team:]
-            for p in excess_away:
-                if home_count < 11:
-                    # Re-classify this player as home
-                    p['team'] = 'home'
-                    home_players.append(p)
-                    home_count += 1
+        if len(away_players) > max_per_team:
+            excess = away_players[max_per_team:]
+            for p in excess:
+                p['team'] = 'unknown'
+            unknown_players.extend(excess)
             away_players = away_players[:max_per_team]
-            away_count = len(away_players)
 
-        # Final cap
-        home_players = home_players[:max_per_team]
-        away_players = away_players[:max_per_team]
         home_count = len(home_players)
         away_count = len(away_players)
 

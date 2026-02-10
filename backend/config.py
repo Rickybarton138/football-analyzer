@@ -44,6 +44,24 @@ class Settings(BaseSettings):
     PLAYER_CLASS_ID: int = 0  # COCO class ID for person
     SPORTS_BALL_CLASS_ID: int = 32  # COCO class ID for sports ball
 
+    # Detection Tuning
+    DETECTION_ASPECT_RATIO_MIN: float = 0.8   # Min H/W ratio for valid player bbox
+    DETECTION_ASPECT_RATIO_MAX: float = 3.0   # Max H/W ratio for valid player bbox
+    DETECTION_MIN_CONFIDENCE_FLOOR: float = 0.15  # Absolute min confidence for retries
+    DETECTION_RETRY_DECAY: float = 0.2        # Confidence decay per retry attempt
+    DETECTION_MIN_BOX_AREA: int = 400         # Min bbox area (px) for jersey color extraction
+
+    # Tracking Tuning
+    TRACKING_IOU_THRESHOLD: float = 0.8       # Match threshold (1 - min_iou)
+    TRACKING_MAX_INTERPOLATION_FRAMES: int = 15  # Max frames to interpolate lost tracks
+    TRACKING_INTERPOLATION_CONFIDENCE_DECAY: float = 0.04  # Confidence decay per interpolated frame
+
+    # Team Classification Tuning
+    TEAM_COLOR_DISTANCE_THRESHOLD: float = 40.0  # LAB distance for referee/unknown
+    TEAM_AMBIGUITY_RATIO: float = 0.85        # min_dist/max_dist ratio above which team is ambiguous
+    TEAM_TEMPORAL_SMOOTHING_WINDOW: int = 5   # Frames for majority-vote team smoothing
+    TEAM_CONSENSUS_THRESHOLD: float = 0.6     # Min fraction for majority vote
+
     # Cloud Inference
     CLOUD_INFERENCE_ENABLED: bool = False
     CLOUD_INFERENCE_URL: Optional[str] = None

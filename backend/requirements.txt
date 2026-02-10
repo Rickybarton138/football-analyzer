@@ -14,6 +14,7 @@ pydantic-settings>=2.1.0
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
 scikit-learn>=1.3.0
+scipy>=1.11.0
 
 # Deep Learning (optional - for local inference)
 # Uncomment if using local GPU processing

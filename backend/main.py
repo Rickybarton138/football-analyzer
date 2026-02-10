@@ -82,6 +82,124 @@ _services: Dict[str, any] = {}
 _analysis_cache: Dict[str, Dict] = {}
 
 
+def _populate_visualization_from_analysis(analysis_result: Dict):
+    """
+    Populate the pitch visualization service and formation tracker from analysis results.
+    This is needed when loading from cache since the services store data in memory.
+    """
+    from services.pitch_visualization import pitch_visualization_service
+    from services.formation_tracking import formation_tracker
+
+    frame_analyses = analysis_result.get('frame_analyses', [])
+    if not frame_analyses:
+        print(f"[VISUALIZATION] No frame_analyses to populate from")
+        return
+
+    # Check if visualization already populated
+    viz_populated = len(pitch_visualization_service.player_positions) > 100
+    # Check if formation tracker already populated (has processed frames)
+    formation_populated = formation_tracker.current_frame > 0
+
+    if viz_populated and formation_populated:
+        print(f"[VISUALIZATION] Already populated (viz: {len(pitch_visualization_service.player_positions)}, formation: frame {formation_tracker.current_frame})")
+        return
+
+    print(f"[VISUALIZATION] Populating services from {len(frame_analyses)} frames (viz: {not viz_populated}, formation: {not formation_populated})...")
+
+    # Get video metadata for FPS
+    metadata = analysis_result.get('metadata', {})
+    fps = metadata.get('fps', 30)
+    total_frames = analysis_result.get('total_frames', len(frame_analyses))
+
+    pitch_visualization_service.set_video_info(fps=fps, total_frames=total_frames)
+    formation_tracker.set_video_info(fps=fps, total_frames=total_frames)
+
+    # Populate from frame analyses
+    player_count = 0
+    ball_count = 0
+    skipped = 0
+
+    for frame in frame_analyses:
+        frame_number = frame.get('frame_number', 0)
+        timestamp_ms = int(frame.get('timestamp', 0) * 1000)
+
+        # Collect detections by team for formation tracker
+        home_detections = []
+        away_detections = []
+
+        # Process player detections
+        detections = frame.get('detections', [])
+        for det in detections:
+            team = det.get('team')
+            if team not in ['home', 'away']:
+                skipped += 1
+                continue
+
+            # Get pitch coordinates (0-100 normalized)
+            pitch_x = det.get('pitch_x')
+            pitch_y = det.get('pitch_y')
+
+            if pitch_x is None or pitch_y is None:
+                skipped += 1
+                continue
+
+            jersey_number = det.get('jersey_number', 0)
+            has_ball = det.get('has_ball', False)
+
+            # Record in pitch visualization (if not already populated)
+            if not viz_populated:
+                pitch_visualization_service.record_player_position(
+                    team=team,
+                    jersey_number=jersey_number,
+                    x=pitch_x,
+                    y=pitch_y,
+                    frame_number=frame_number,
+                    timestamp_ms=timestamp_ms,
+                    has_ball=has_ball
+                )
+                player_count += 1
+
+            # Collect for formation tracker
+            if not formation_populated:
+                player_data = {
+                    'jersey_number': jersey_number,
+                    'x': pitch_x,
+                    'y': pitch_y
+                }
+                if team == 'home':
+                    home_detections.append(player_data)
+                else:
+                    away_detections.append(player_data)
+
+        # Process frame through formation tracker (if not already populated)
+        if not formation_populated:
+            formation_tracker.process_frame(
+                frame_number=frame_number,
+                timestamp_ms=timestamp_ms,
+                home_detections=home_detections,
+                away_detections=away_detections
+            )
+
+        # Process ball position (if not already populated)
+        if not viz_populated:
+            ball_x = frame.get('ball_pitch_x')
+            ball_y = frame.get('ball_pitch_y')
+
+            if ball_x is not None and ball_y is not None:
+                pitch_visualization_service.record_ball_position(
+                    x=ball_x,
+                    y=ball_y,
+                    frame_number=frame_number,
+                    timestamp_ms=timestamp_ms
+                )
+                ball_count += 1
+
+    if not viz_populated:
+        print(f"[VISUALIZATION] Populated {player_count} player positions, {ball_count} ball positions (skipped {skipped})")
+    if not formation_populated:
+        print(f"[FORMATION] Formation tracker initialized with {len(frame_analyses)} frames")
+
+
 def get_services():
     """Lazy load services to avoid initialization overhead."""
     if not _services:
@@ -2794,6 +2912,8 @@ async def get_full_analysis(video_id: Optional[str] = None):
                 cached_result, cached_mtime = _analysis_cache[cache_key]
                 if cached_mtime == file_mtime:
                     print(f"[ANALYSIS] Using cached analysis for {json_path.name}")
+                    # Repopulate pitch visualization service from cached result
+                    _populate_visualization_from_analysis(cached_result)
                     return cached_result
 
             print(f"[ANALYSIS] Processing analysis for {json_path.name} (not in cache or file modified)")
@@ -5928,6 +6048,123 @@ async def get_2d_radar(frame_number: Optional[int] = None):
         frame_number: Specific frame to get (None for current state)
     """
     return pitch_visualization_service.get_2d_radar_state(frame_number)
+
+
+@app.get("/api/visualization/2d-radar-full")
+async def get_2d_radar_full(frame_number: Optional[int] = None):
+    """
+    Get 2D radar with guaranteed 22 players (11 per team).
+
+    Uses formation tracking service to interpolate positions for
+    any players that were not detected in the current frame.
+
+    Args:
+        frame_number: Specific frame to get (None for current state)
+
+    Returns:
+        Dictionary with:
+        - frame_number: Current frame
+        - players: {home: [...11 players...], away: [...11 players...]}
+        - ball: Ball position if available
+        - formations: {home: "4-4-2", away: "4-3-3"}
+        - metrics: Formation metrics (line positions, width, depth)
+        - interpolation_info: Count of interpolated players
+    """
+    from services.formation_tracking import formation_tracker
+
+    # Get basic radar state for ball position
+    basic_state = pitch_visualization_service.get_2d_radar_state(frame_number)
+
+    # Get all 22 players from formation tracker
+    formation_state = formation_tracker.get_all_22_positions(frame_number)
+
+    # Merge ball position from basic state
+    formation_state["ball"] = basic_state.get("ball")
+
+    return formation_state
+
+
+@app.get("/api/formation/all-22")
+async def get_all_22_players(frame_number: Optional[int] = None):
+    """
+    Get positions of all 22 players on the pitch.
+
+    Always returns exactly 11 players per team. If a player was not
+    detected, their position is interpolated from previous detections.
+
+    Args:
+        frame_number: Specific frame (None for current)
+
+    Returns:
+        Dictionary with home and away player arrays (11 each),
+        formation detection, and interpolation statistics.
+    """
+    from services.formation_tracking import formation_tracker
+    return formation_tracker.get_all_22_positions(frame_number)
+
+
+@app.get("/api/formation/trends")
+async def get_formation_trends(last_n_seconds: int = 60):
+    """
+    Get formation trends over a time period.
+
+    Analyzes formation changes, line positions, and tactical trends.
+
+    Args:
+        last_n_seconds: Time period to analyze (default 60 seconds)
+
+    Returns:
+        Dictionary with:
+        - home/away formation counts and primary formation
+        - Defensive line trends (pushing up, dropping back, stable)
+        - Number of snapshots analyzed
+    """
+    from services.formation_tracking import formation_tracker
+    return formation_tracker.get_formation_trends(last_n_seconds)
+
+
+@app.post("/api/formation/process-frame")
+async def process_formation_frame(
+    frame_number: int,
+    timestamp_ms: int,
+    home_players: List[Dict],
+    away_players: List[Dict]
+):
+    """
+    Process a frame through the formation tracking system.
+
+    This endpoint is called during video analysis to feed player
+    detections into the formation tracker.
+
+    Args:
+        frame_number: Frame number
+        timestamp_ms: Timestamp in milliseconds
+        home_players: List of {jersey_number, x, y} for home team
+        away_players: List of {jersey_number, x, y} for away team
+
+    Returns:
+        Current formation state with all 22 players
+    """
+    from services.formation_tracking import formation_tracker
+
+    return formation_tracker.process_frame(
+        frame_number=frame_number,
+        timestamp_ms=timestamp_ms,
+        home_detections=home_players,
+        away_detections=away_players
+    )
+
+
+@app.get("/api/formation/reset")
+async def reset_formation_tracker():
+    """
+    Reset the formation tracker for a new match.
+
+    Clears all player slot assignments and position history.
+    """
+    from services.formation_tracking import formation_tracker
+    formation_tracker.reset()
+    return {"status": "ok", "message": "Formation tracker reset"}
 
 
 @app.get("/api/visualization/player-trail/{team}/{jersey_number}")

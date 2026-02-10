@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import LiveCoaching from './components/LiveCoaching';
+import CameraCapture from './components/CameraCapture';
+import SmartCameraMode from './components/SmartCameraMode';
 
 // Types
 interface MatchAnalysis {
@@ -36,7 +38,7 @@ interface Detection {
 }
 
 // Simplified tab structure - consolidated from 13 to 5 main views + training + live
-type Tab = 'video' | 'analysis' | 'aicoach' | 'players' | 'tactical' | 'training' | 'live' | 'jersey' | 'radar' | 'spotlight';
+type Tab = 'video' | 'analysis' | 'aicoach' | 'players' | 'tactical' | 'training' | 'live' | 'jersey' | 'radar' | 'spotlight' | 'camera';
 
 // Shot detection types
 interface DetectedShot {
@@ -1014,6 +1016,7 @@ function App() {
 
   // Simplified navigation - 6 main tabs + live coaching
   const tabs: { id: Tab; label: string; icon: string; description: string }[] = [
+    { id: 'camera', label: 'Record Match', icon: '🎥', description: 'Smart match capture & recording' },
     { id: 'video', label: 'Match Video', icon: '🎬', description: 'Video with tracking overlays' },
     { id: 'analysis', label: 'Match Analysis', icon: '📊', description: 'Stats, heatmaps & formations' },
     { id: 'aicoach', label: 'AI Coach', icon: '🧠', description: 'Tactical insights & recommendations' },
@@ -1110,6 +1113,7 @@ function App() {
 
       {/* Main Content */}
       <main className="max-w-7xl mx-auto px-6 py-6">
+        {activeTab === 'camera' && <CameraView />}
         {activeTab === 'video' && <VideoPlayerWithTracking analysis={analysis} />}
         {activeTab === 'analysis' && <CombinedAnalysisView analysis={analysis} stats={stats} />}
         {activeTab === 'aicoach' && <AICoachView />}
@@ -4098,12 +4102,125 @@ interface JerseyDetection {
   pending?: boolean;
 }
 
+// ==================== CAMERA VIEW ====================
+function CameraView() {
+  const [mode, setMode] = useState<'select' | 'simple' | 'smart'>('select');
+
+  if (mode === 'simple') {
+    return (
+      <div>
+        <button
+          onClick={() => setMode('select')}
+          className="mb-4 px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600"
+        >
+          ← Back to Camera Selection
+        </button>
+        <CameraCapture />
+      </div>
+    );
+  }
+
+  if (mode === 'smart') {
+    return <SmartCameraMode />;
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="bg-slate-800/50 rounded-xl p-6 border border-slate-700/50">
+        <h2 className="text-2xl font-bold text-white mb-2">Match Recording</h2>
+        <p className="text-slate-400">Choose your recording mode to capture match footage for analysis</p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {/* Simple Capture Mode */}
+        <div
+          onClick={() => setMode('simple')}
+          className="bg-slate-800/50 rounded-xl p-6 border border-slate-700/50 hover:border-cyan-500/50 cursor-pointer transition-all group"
+        >
+          <div className="text-5xl mb-4">📹</div>
+          <h3 className="text-xl font-bold text-white mb-2 group-hover:text-cyan-400">Quick Capture</h3>
+          <p className="text-slate-400 mb-4">
+            Simple recording with quality monitoring and pitch alignment guides.
+            Perfect for quick training sessions.
+          </p>
+          <ul className="text-sm text-slate-300 space-y-1">
+            <li>✓ Real-time quality feedback</li>
+            <li>✓ Pitch alignment overlay</li>
+            <li>✓ 1080p/4K recording</li>
+            <li>✓ Direct upload to analyzer</li>
+          </ul>
+          <div className="mt-4 text-cyan-400 font-medium group-hover:underline">
+            Start Quick Capture →
+          </div>
+        </div>
+
+        {/* Smart Match Mode */}
+        <div
+          onClick={() => setMode('smart')}
+          className="bg-slate-800/50 rounded-xl p-6 border border-slate-700/50 hover:border-green-500/50 cursor-pointer transition-all group"
+        >
+          <div className="text-5xl mb-4">🎬</div>
+          <h3 className="text-xl font-bold text-white mb-2 group-hover:text-green-400">Smart Match Recording</h3>
+          <p className="text-slate-400 mb-4">
+            Full match recording with pitch calibration, auto-tracking, and
+            intelligent features. Rivals VEO GO!
+          </p>
+          <ul className="text-sm text-slate-300 space-y-1">
+            <li>✓ Pitch corner calibration</li>
+            <li>✓ Match timer with periods</li>
+            <li>✓ Motion-triggered auto-record</li>
+            <li>✓ Live player detection preview</li>
+            <li>✓ Half-time auto-pause</li>
+          </ul>
+          <div className="mt-4 text-green-400 font-medium group-hover:underline">
+            Start Smart Recording →
+          </div>
+        </div>
+      </div>
+
+      {/* Tips Section */}
+      <div className="bg-gradient-to-r from-cyan-500/10 to-green-500/10 rounded-xl p-6 border border-cyan-500/30">
+        <h3 className="text-lg font-bold text-white mb-4">📋 Recording Best Practices</h3>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <div>
+            <h4 className="font-medium text-cyan-400 mb-2">Camera Position</h4>
+            <ul className="text-sm text-slate-300 space-y-1">
+              <li>• Elevated (15-30m high)</li>
+              <li>• Central or behind goal</li>
+              <li>• Full pitch visible</li>
+            </ul>
+          </div>
+          <div>
+            <h4 className="font-medium text-green-400 mb-2">Equipment</h4>
+            <ul className="text-sm text-slate-300 space-y-1">
+              <li>• Use a stable tripod</li>
+              <li>• Wide-angle lens (90°+)</li>
+              <li>• Ensure good lighting</li>
+            </ul>
+          </div>
+          <div>
+            <h4 className="font-medium text-yellow-400 mb-2">Quality Tips</h4>
+            <ul className="text-sm text-slate-300 space-y-1">
+              <li>• 1080p minimum, 4K ideal</li>
+              <li>• 30 FPS for tracking</li>
+              <li>• Avoid camera movement</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ==================== 2D RADAR VIEW (VEO-STYLE) ====================
 interface RadarPlayer {
   jersey_number: number;
   x: number;
   y: number;
   has_ball?: boolean;
+  is_interpolated?: boolean;
+  role?: string;
+  frames_since_seen?: number;
 }
 
 interface RadarState {
@@ -4114,6 +4231,11 @@ interface RadarState {
     away: RadarPlayer[];
   };
   ball: { x: number; y: number } | null;
+  formations?: {
+    home: string;
+    away: string;
+  };
+  interpolated_count?: number;
 }
 
 interface TeamShape {
@@ -4132,6 +4254,8 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [showTrails, setShowTrails] = useState(false);
   const [showFormationLines, setShowFormationLines] = useState(true);
+  const [showInterpolated, setShowInterpolated] = useState(true);
+  const [useFullTracking, setUseFullTracking] = useState(true); // Use 22-player tracking
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [loading, setLoading] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -4144,10 +4268,21 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
 
   const fetchRadarState = async (frame?: number) => {
     try {
+      // Use full tracking endpoint for guaranteed 22 players, with fallback
+      const endpoint = useFullTracking ? '2d-radar-full' : '2d-radar';
       const url = frame !== undefined
-        ? `http://localhost:8000/api/visualization/2d-radar?frame_number=${frame}`
-        : 'http://localhost:8000/api/visualization/2d-radar';
-      const response = await fetch(url);
+        ? `http://localhost:8000/api/visualization/${endpoint}?frame_number=${frame}`
+        : `http://localhost:8000/api/visualization/${endpoint}`;
+      let response = await fetch(url);
+
+      // Fallback to regular endpoint if full tracking isn't available (404)
+      if (!response.ok && useFullTracking) {
+        const fallbackUrl = frame !== undefined
+          ? `http://localhost:8000/api/visualization/2d-radar?frame_number=${frame}`
+          : 'http://localhost:8000/api/visualization/2d-radar';
+        response = await fetch(fallbackUrl);
+      }
+
       if (response.ok) {
         const data = await response.json();
         setRadarState(data);
@@ -4179,7 +4314,7 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
       if (!isPlaying) fetchRadarState();
     }, 2000);
     return () => clearInterval(interval);
-  }, [isPlaying]);
+  }, [isPlaying, useFullTracking]);
 
   useEffect(() => {
     if (currentFrame > 0) {
@@ -4323,46 +4458,56 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
 
     // Draw players if we have radar state
     if (radarState) {
-      // Home players (blue)
-      radarState.players.home.forEach(player => {
+      // Helper function to draw a player
+      const drawPlayer = (player: RadarPlayer, teamColor: string) => {
         const x = PADDING + (player.x / 100) * PITCH_WIDTH;
         const y = PADDING + (player.y / 100) * PITCH_HEIGHT;
+        const isInterpolated = player.is_interpolated && showInterpolated;
 
         // Player circle
         ctx.beginPath();
         ctx.arc(x, y, 12, 0, Math.PI * 2);
-        ctx.fillStyle = player.has_ball ? '#22c55e' : '#3b82f6'; // Green if has ball, else blue
-        ctx.fill();
-        ctx.strokeStyle = '#fff';
+
+        if (isInterpolated) {
+          // Interpolated players: semi-transparent with dashed outline
+          ctx.fillStyle = player.has_ball ? 'rgba(34, 197, 94, 0.5)' : teamColor.replace(')', ', 0.5)').replace('rgb', 'rgba');
+          ctx.fill();
+          ctx.setLineDash([3, 3]);
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+        } else {
+          // Detected players: solid colors
+          ctx.fillStyle = player.has_ball ? '#22c55e' : teamColor;
+          ctx.fill();
+          ctx.setLineDash([]);
+          ctx.strokeStyle = '#fff';
+        }
         ctx.lineWidth = 2;
         ctx.stroke();
+        ctx.setLineDash([]);
 
         // Jersey number
-        ctx.fillStyle = '#fff';
+        ctx.fillStyle = isInterpolated ? 'rgba(255, 255, 255, 0.7)' : '#fff';
         ctx.font = 'bold 10px Arial';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(player.jersey_number.toString(), x, y);
+
+        // Show role indicator for interpolated players
+        if (isInterpolated && player.role) {
+          ctx.font = '8px Arial';
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+          ctx.fillText(player.role, x, y + 18);
+        }
+      };
+
+      // Home players (blue)
+      radarState.players.home.forEach(player => {
+        drawPlayer(player, '#3b82f6');
       });
 
       // Away players (red)
       radarState.players.away.forEach(player => {
-        const x = PADDING + (player.x / 100) * PITCH_WIDTH;
-        const y = PADDING + (player.y / 100) * PITCH_HEIGHT;
-
-        ctx.beginPath();
-        ctx.arc(x, y, 12, 0, Math.PI * 2);
-        ctx.fillStyle = player.has_ball ? '#22c55e' : '#ef4444';
-        ctx.fill();
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 2;
-        ctx.stroke();
-
-        ctx.fillStyle = '#fff';
-        ctx.font = 'bold 10px Arial';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(player.jersey_number.toString(), x, y);
+        drawPlayer(player, '#ef4444');
       });
 
       // Ball (yellow)
@@ -4407,7 +4552,7 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
       }
     }
 
-  }, [radarState, homeShape, awayShape, showFormationLines, showTrails]);
+  }, [radarState, homeShape, awayShape, showFormationLines, showTrails, showInterpolated]);
 
   const handleFrameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const frame = parseInt(e.target.value);
@@ -4429,7 +4574,7 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
               Real-time overhead view of player positions and team shape
             </p>
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-4 flex-wrap">
             <div className="flex items-center gap-2">
               <div className="w-4 h-4 bg-blue-500 rounded-full"></div>
               <span className="text-sm text-slate-300">Home</span>
@@ -4442,6 +4587,12 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
               <div className="w-4 h-4 bg-yellow-500 rounded-full"></div>
               <span className="text-sm text-slate-300">Ball</span>
             </div>
+            {useFullTracking && (
+              <div className="flex items-center gap-2">
+                <div className="w-4 h-4 rounded-full border-2 border-dashed border-slate-400 opacity-50"></div>
+                <span className="text-sm text-slate-400">Interpolated</span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -4478,6 +4629,28 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
             />
             Show Formation
           </label>
+
+          <label className="flex items-center gap-2 text-sm text-slate-300">
+            <input
+              type="checkbox"
+              checked={useFullTracking}
+              onChange={(e) => setUseFullTracking(e.target.checked)}
+              className="rounded"
+            />
+            22-Player Tracking
+          </label>
+
+          {useFullTracking && (
+            <label className="flex items-center gap-2 text-sm text-slate-300">
+              <input
+                type="checkbox"
+                checked={showInterpolated}
+                onChange={(e) => setShowInterpolated(e.target.checked)}
+                className="rounded"
+              />
+              Show Interpolated
+            </label>
+          )}
         </div>
 
         {/* Frame slider */}
@@ -4520,12 +4693,17 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
             <h3 className="font-bold text-blue-400 mb-3 flex items-center gap-2">
               <div className="w-3 h-3 bg-blue-500 rounded-full"></div>
               Home Team
+              {radarState?.formations?.home && (
+                <span className="ml-auto text-sm font-normal text-blue-300 bg-blue-500/20 px-2 py-0.5 rounded">
+                  {radarState.formations.home}
+                </span>
+              )}
             </h3>
             {homeShape && (
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-slate-400">Players Tracked:</span>
-                  <span className="text-white">{homeShape.players.length}</span>
+                  <span className="text-white">{radarState?.players?.home?.length || homeShape.players.length}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-400">Team Width:</span>
@@ -4543,10 +4721,18 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
             )}
             {radarState && (
               <div className="mt-3 pt-3 border-t border-slate-700">
-                <span className="text-slate-400 text-xs">Jersey Numbers:</span>
+                <span className="text-slate-400 text-xs">Players ({radarState.players.home.length}):</span>
                 <div className="flex flex-wrap gap-1 mt-1">
                   {radarState.players.home.map(p => (
-                    <span key={p.jersey_number} className="px-2 py-0.5 bg-blue-500/20 text-blue-300 rounded text-xs">
+                    <span
+                      key={p.jersey_number}
+                      className={`px-2 py-0.5 rounded text-xs ${
+                        p.is_interpolated
+                          ? 'bg-blue-500/10 text-blue-400 border border-dashed border-blue-400/50'
+                          : 'bg-blue-500/20 text-blue-300'
+                      }`}
+                      title={p.is_interpolated ? `Interpolated (${p.role || 'unknown role'})` : 'Detected'}
+                    >
                       #{p.jersey_number}
                     </span>
                   ))}
@@ -4560,12 +4746,17 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
             <h3 className="font-bold text-red-400 mb-3 flex items-center gap-2">
               <div className="w-3 h-3 bg-red-500 rounded-full"></div>
               Away Team
+              {radarState?.formations?.away && (
+                <span className="ml-auto text-sm font-normal text-red-300 bg-red-500/20 px-2 py-0.5 rounded">
+                  {radarState.formations.away}
+                </span>
+              )}
             </h3>
             {awayShape && (
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-slate-400">Players Tracked:</span>
-                  <span className="text-white">{awayShape.players.length}</span>
+                  <span className="text-white">{radarState?.players?.away?.length || awayShape.players.length}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-400">Team Width:</span>
@@ -4583,10 +4774,18 @@ function Radar2DView({ analysis }: { analysis: MatchAnalysis | null }) {
             )}
             {radarState && (
               <div className="mt-3 pt-3 border-t border-slate-700">
-                <span className="text-slate-400 text-xs">Jersey Numbers:</span>
+                <span className="text-slate-400 text-xs">Players ({radarState.players.away.length}):</span>
                 <div className="flex flex-wrap gap-1 mt-1">
                   {radarState.players.away.map(p => (
-                    <span key={p.jersey_number} className="px-2 py-0.5 bg-red-500/20 text-red-300 rounded text-xs">
+                    <span
+                      key={p.jersey_number}
+                      className={`px-2 py-0.5 rounded text-xs ${
+                        p.is_interpolated
+                          ? 'bg-red-500/10 text-red-400 border border-dashed border-red-400/50'
+                          : 'bg-red-500/20 text-red-300'
+                      }`}
+                      title={p.is_interpolated ? `Interpolated (${p.role || 'unknown role'})` : 'Detected'}
+                    >
                       #{p.jersey_number}
                     </span>
                   ))}

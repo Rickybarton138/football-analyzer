@@ -650,6 +650,305 @@ class PitchVisualizationService:
             "fps": self.fps
         }
 
+    def generate_pressure_map(
+        self,
+        team: str,
+        start_frame: Optional[int] = None,
+        end_frame: Optional[int] = None
+    ) -> Dict:
+        """
+        Generate a pressure map showing where a team applies pressing.
+
+        Pressure is calculated based on player density around the ball
+        when the opposing team has possession.
+        """
+        grid = np.zeros((self.HEATMAP_GRID_Y, self.HEATMAP_GRID_X))
+
+        cell_width = self.PITCH_LENGTH / self.HEATMAP_GRID_X
+        cell_height = self.PITCH_WIDTH / self.HEATMAP_GRID_Y
+
+        # Get ball positions and nearby pressing players
+        for ball in self.ball_positions:
+            if start_frame and ball.frame_number < start_frame:
+                continue
+            if end_frame and ball.frame_number > end_frame:
+                continue
+
+            # Count pressing players near the ball
+            pressing_count = 0
+            for player in self.player_positions:
+                if player.frame_number == ball.frame_number and player.team == team:
+                    dist = np.sqrt((player.x - ball.x)**2 + (player.y - ball.y)**2)
+                    if dist < 15:  # Within pressing distance
+                        pressing_count += 1
+
+            if pressing_count >= 2:  # At least 2 players pressing
+                grid_x = int(ball.x / cell_width)
+                grid_y = int(ball.y / cell_height)
+                grid_x = max(0, min(self.HEATMAP_GRID_X - 1, grid_x))
+                grid_y = max(0, min(self.HEATMAP_GRID_Y - 1, grid_y))
+                grid[grid_y, grid_x] += pressing_count
+
+        max_val = grid.max()
+        if max_val > 0:
+            normalized_grid = (grid / max_val).tolist()
+        else:
+            normalized_grid = grid.tolist()
+
+        return {
+            "grid": normalized_grid,
+            "max_value": float(max_val),
+            "team": team,
+            "type": "pressure_map",
+            "grid_dimensions": {
+                "x": self.HEATMAP_GRID_X,
+                "y": self.HEATMAP_GRID_Y
+            }
+        }
+
+    def generate_shot_map(self, shots: List[Dict]) -> Dict:
+        """
+        Generate shot map data for visualization.
+
+        Args:
+            shots: List of shot dictionaries with x, y, xg, is_goal, team, etc.
+
+        Returns:
+            Formatted shot map data for frontend
+        """
+        home_shots = []
+        away_shots = []
+
+        for shot in shots:
+            shot_data = {
+                "x": shot.get("x", 0),
+                "y": shot.get("y", 0),
+                "xg": shot.get("xg", 0),
+                "is_goal": shot.get("is_goal", False),
+                "on_target": shot.get("on_target", False),
+                "player": shot.get("player_jersey") or shot.get("player"),
+                "timestamp_ms": shot.get("timestamp_ms", 0),
+                "shot_type": shot.get("shot_type", "foot"),
+                # Size based on xG for visualization
+                "size": max(8, min(30, shot.get("xg", 0.1) * 60))
+            }
+
+            if shot.get("team") == "home":
+                home_shots.append(shot_data)
+            else:
+                away_shots.append(shot_data)
+
+        # Calculate totals
+        home_xg = sum(s["xg"] for s in home_shots)
+        away_xg = sum(s["xg"] for s in away_shots)
+        home_goals = sum(1 for s in home_shots if s["is_goal"])
+        away_goals = sum(1 for s in away_shots if s["is_goal"])
+
+        return {
+            "home": {
+                "shots": home_shots,
+                "total_shots": len(home_shots),
+                "total_xg": round(home_xg, 2),
+                "goals": home_goals,
+                "xg_per_shot": round(home_xg / max(1, len(home_shots)), 3)
+            },
+            "away": {
+                "shots": away_shots,
+                "total_shots": len(away_shots),
+                "total_xg": round(away_xg, 2),
+                "goals": away_goals,
+                "xg_per_shot": round(away_xg / max(1, len(away_shots)), 3)
+            },
+            "comparison": {
+                "xg_difference": round(home_xg - away_xg, 2),
+                "shot_difference": len(home_shots) - len(away_shots),
+                "home_conversion": round(home_goals / max(1, len(home_shots)) * 100, 1),
+                "away_conversion": round(away_goals / max(1, len(away_shots)) * 100, 1)
+            }
+        }
+
+    def get_defensive_line_data(
+        self,
+        team: str,
+        frame_number: Optional[int] = None
+    ) -> Dict:
+        """
+        Get defensive line position data for visualization.
+
+        Returns the positions of the back line players.
+        """
+        if frame_number is not None:
+            positions = [
+                p for p in self.player_positions
+                if p.team == team and p.frame_number == frame_number
+            ]
+        else:
+            # Use current positions
+            positions = [
+                {"jersey": j, "x": pos[0], "y": pos[1]}
+                for (t, j), pos in self.current_player_positions.items()
+                if t == team
+            ]
+
+        if not positions:
+            return {"team": team, "line": None, "players": []}
+
+        # Sort by x position to find defensive line
+        if team == "home":
+            # Home defends left (lower x values)
+            sorted_pos = sorted(positions, key=lambda p: p.x if hasattr(p, 'x') else p.get('x', 50))
+        else:
+            # Away defends right (higher x values)
+            sorted_pos = sorted(positions, key=lambda p: -(p.x if hasattr(p, 'x') else p.get('x', 50)))
+
+        # Get back 4 players (excluding obvious goalkeeper at extreme)
+        defenders = sorted_pos[1:5] if len(sorted_pos) > 4 else sorted_pos
+
+        if not defenders:
+            return {"team": team, "line": None, "players": []}
+
+        # Calculate line metrics
+        x_positions = [p.x if hasattr(p, 'x') else p.get('x', 50) for p in defenders]
+        y_positions = [p.y if hasattr(p, 'y') else p.get('y', 50) for p in defenders]
+
+        return {
+            "team": team,
+            "line": {
+                "avg_x": round(np.mean(x_positions), 1),
+                "min_x": round(min(x_positions), 1),
+                "max_x": round(max(x_positions), 1),
+                "spread": round(max(x_positions) - min(x_positions), 1),
+                "is_flat": max(x_positions) - min(x_positions) < 5
+            },
+            "players": [
+                {
+                    "jersey": p.jersey_number if hasattr(p, 'jersey_number') else p.get('jersey'),
+                    "x": p.x if hasattr(p, 'x') else p.get('x'),
+                    "y": p.y if hasattr(p, 'y') else p.get('y')
+                }
+                for p in defenders
+            ],
+            "offside_line": round(min(x_positions), 1) if team == "home" else round(max(x_positions), 1)
+        }
+
+    def get_passing_network_data(
+        self,
+        team: str,
+        passes: List[Dict]
+    ) -> Dict:
+        """
+        Generate passing network visualization data.
+
+        Args:
+            team: Team to generate network for
+            passes: List of pass events with from_player, to_player, x, y, end_x, end_y
+
+        Returns:
+            Network data with nodes (players) and edges (passes)
+        """
+        from collections import defaultdict
+
+        team_passes = [p for p in passes if p.get("team") == team]
+
+        # Count passes between each pair
+        pass_counts = defaultdict(int)
+        player_passes = defaultdict(int)
+        player_positions = defaultdict(list)
+
+        for p in team_passes:
+            from_player = p.get("from_player") or p.get("player_jersey")
+            to_player = p.get("to_player")
+
+            if from_player and to_player:
+                key = (min(from_player, to_player), max(from_player, to_player))
+                pass_counts[key] += 1
+                player_passes[from_player] += 1
+
+            # Track positions
+            if from_player and p.get("x") is not None and p.get("y") is not None:
+                player_positions[from_player].append((p["x"], p["y"]))
+
+        # Calculate average positions for nodes
+        nodes = []
+        for player, positions in player_positions.items():
+            if positions:
+                avg_x = np.mean([p[0] for p in positions])
+                avg_y = np.mean([p[1] for p in positions])
+                nodes.append({
+                    "id": player,
+                    "jersey_number": player,
+                    "x": round(avg_x, 1),
+                    "y": round(avg_y, 1),
+                    "passes": player_passes[player],
+                    "size": max(20, min(50, player_passes[player] * 2))
+                })
+
+        # Create edges
+        edges = []
+        max_passes = max(pass_counts.values()) if pass_counts else 1
+        for (p1, p2), count in pass_counts.items():
+            if count >= 2:  # Only show connections with 2+ passes
+                edges.append({
+                    "source": p1,
+                    "target": p2,
+                    "weight": count,
+                    "thickness": max(1, min(8, (count / max_passes) * 8))
+                })
+
+        return {
+            "team": team,
+            "nodes": nodes,
+            "edges": edges,
+            "total_passes": len(team_passes),
+            "unique_connections": len(edges)
+        }
+
+    def get_sprint_map_data(self, sprints: List[Dict]) -> Dict:
+        """
+        Generate sprint visualization data.
+
+        Args:
+            sprints: List of sprint events with start/end positions
+
+        Returns:
+            Sprint map data for visualization
+        """
+        home_sprints = []
+        away_sprints = []
+
+        for sprint in sprints:
+            sprint_data = {
+                "start_x": sprint.get("start_position", (0, 0))[0] if isinstance(sprint.get("start_position"), tuple) else sprint.get("start_x", 0),
+                "start_y": sprint.get("start_position", (0, 0))[1] if isinstance(sprint.get("start_position"), tuple) else sprint.get("start_y", 0),
+                "end_x": sprint.get("end_position", (0, 0))[0] if isinstance(sprint.get("end_position"), tuple) else sprint.get("end_x", 0),
+                "end_y": sprint.get("end_position", (0, 0))[1] if isinstance(sprint.get("end_position"), tuple) else sprint.get("end_y", 0),
+                "max_speed_kmh": sprint.get("max_speed_kmh", 0),
+                "distance_m": sprint.get("distance_m", 0),
+                "player_id": sprint.get("player_id"),
+                "jersey_number": sprint.get("jersey_number"),
+                "timestamp_ms": sprint.get("start_time_ms", 0)
+            }
+
+            if sprint.get("team") == "home":
+                home_sprints.append(sprint_data)
+            else:
+                away_sprints.append(sprint_data)
+
+        return {
+            "home": {
+                "sprints": home_sprints,
+                "total_sprints": len(home_sprints),
+                "avg_speed": round(np.mean([s["max_speed_kmh"] for s in home_sprints]), 1) if home_sprints else 0,
+                "total_distance": round(sum(s["distance_m"] for s in home_sprints), 1)
+            },
+            "away": {
+                "sprints": away_sprints,
+                "total_sprints": len(away_sprints),
+                "avg_speed": round(np.mean([s["max_speed_kmh"] for s in away_sprints]), 1) if away_sprints else 0,
+                "total_distance": round(sum(s["distance_m"] for s in away_sprints), 1)
+            }
+        }
+
     def reset(self):
         """Reset all visualization data."""
         self.player_positions.clear()
