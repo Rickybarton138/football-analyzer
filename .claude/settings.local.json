@@ -7,7 +7,30 @@
       "Bash(python -m uvicorn:*)",
       "Bash(npm run dev:*)",
       "Bash(curl:*)",
-      "Bash(npx tsc:*)"
+      "Bash(npx tsc:*)",
+      "Bash(npm install:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "WebFetch(domain:www.dorsetfa.com)",
+      "WebFetch(domain:www.thefa.com)",
+      "WebFetch(domain:www.uefa.com)",
+      "Bash(npm run build:*)",
+      "Bash(explorer \"c:\\\\Users\\\\info\\\\projects\\\\coach-mentor\\\\docs\")",
+      "WebFetch(domain:learn.englandfootball.com)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial commit: CoachMentor - AI-Powered Grassroots Football Coaching\n\nFeatures:\n- AI session generator aligned to FA coaching standards\n- Session evaluator with UEFA C/B/A criteria\n- 24/7 AI mentor chat\n- Session library with 26+ curated plans \\(including England Football\\)\n- Pitch planner tool\n- Match day companion\n- Video library\n- Assessment prep resources\n- 7-day free trial with £7.99/mo subscription \\(Stripe integration\\)\n\nBuilt on FA frameworks: 4 Corner Model, England DNA, Plan-Do-Review\nEOF\n\\)\")",
+      "Bash(gh repo create:*)",
+      "Bash(railway version:*)",
+      "Bash(railway login:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nRemove direct API references and route all AI through backend\n\n- Remove all Anthropic/Claude references from frontend code\n- Route image/document AI calls through backend API\n- Remove fallback API key mode \\(now subscription-only\\)\n- Clean up unused state variables and functions\n- Fix billing.portal\\(\\) -> billing.openPortal\\(\\) typo\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push:*)",
+      "Bash(railway whoami:*)",
+      "Bash(git commit:*)",
+      "WebFetch(domain:coachmentor-api.onrender.com)",
+      "WebFetch(domain:coachmentor.onrender.com)",
+      "Bash(powershell -Command:*)",
+      "Bash(git restore:*)"
     ]
   }
 }

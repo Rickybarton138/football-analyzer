@@ -716,8 +716,9 @@ class LocalVideoProcessor:
                         raw_detected_players.append(raw_player)
 
                     # Run real tracking to get consistent IDs across frames
+                    # Pass frame for appearance histogram extraction (better re-ID)
                     tracked_players = await self.tracking_service.update(
-                        raw_detected_players, frame_count
+                        raw_detected_players, frame_count, frame=frame
                     )
 
                     # Process tracked players with persistent IDs

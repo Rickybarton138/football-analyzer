@@ -128,7 +128,7 @@ class TrackingService:
         track_low_thresh: float = 0.1,
         new_track_thresh: float = 0.4,  # Lowered to catch distant players
         match_thresh: float = 0.8,  # Higher = stricter IoU matching
-        track_buffer: int = 90  # Extended from 30 to handle longer occlusions (3 sec at 30fps)
+        track_buffer: int = 15  # Keep lost tracks for 15 processed frames (~5s at 3fps)
     ):
         self.track_high_thresh = track_high_thresh
         self.track_low_thresh = track_low_thresh
@@ -151,7 +151,10 @@ class TrackingService:
         # Graveyard for re-identification of lost tracks
         # Stores (TrackState, death_frame) for recently dead tracks
         self.graveyard: Dict[int, Tuple[TrackState, int]] = {}
-        self.graveyard_max_age: int = 300  # Keep dead tracks for ~10s at 30fps
+        self.graveyard_max_age: int = 90  # Keep dead tracks for ~30s at 3fps
+
+        # Camera motion compensation
+        self.prev_gray: Optional[np.ndarray] = None  # Previous frame (grayscale)
 
     def _extract_appearance_histogram(self, frame: np.ndarray, bbox: np.ndarray) -> Optional[np.ndarray]:
         """Extract 48-bin HSV histogram from player ROI for appearance matching."""
@@ -174,6 +177,123 @@ class TrackingService:
         hist = np.concatenate([hist_h, hist_s, hist_v]).flatten()
         cv2.normalize(hist, hist)
         return hist
+
+    def _estimate_camera_motion(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Estimate global camera motion between previous and current frame.
+
+        Uses sparse optical flow on background features + RANSAC affine estimation
+        to compute the 2x3 affine transform representing camera pan/zoom/rotation.
+
+        Returns:
+            2x3 affine matrix if successful, None if estimation failed.
+        """
+        if frame is None:
+            return None
+
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if self.prev_gray is None:
+            self.prev_gray = curr_gray
+            return None
+
+        # Find good features to track in the previous frame
+        # Use a coarse grid to get well-distributed points (mostly background/pitch)
+        prev_pts = cv2.goodFeaturesToTrack(
+            self.prev_gray,
+            maxCorners=200,
+            qualityLevel=0.01,
+            minDistance=30,
+            blockSize=7
+        )
+
+        if prev_pts is None or len(prev_pts) < 10:
+            self.prev_gray = curr_gray
+            return None
+
+        # Track features to current frame using Lucas-Kanade optical flow
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray, curr_gray, prev_pts, None,
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
+        )
+
+        # Filter to successfully tracked points
+        good_mask = status.flatten() == 1
+        if good_mask.sum() < 6:
+            self.prev_gray = curr_gray
+            return None
+
+        prev_good = prev_pts[good_mask]
+        curr_good = curr_pts[good_mask]
+
+        # Estimate partial affine (translation + rotation + uniform scale)
+        # RANSAC automatically rejects outliers (points on moving players)
+        affine_matrix, inliers = cv2.estimateAffinePartial2D(
+            prev_good, curr_good,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=5.0
+        )
+
+        self.prev_gray = curr_gray
+
+        if affine_matrix is None:
+            return None
+
+        # Validate: reject if too extreme (corrupt estimation)
+        # Extract translation and scale
+        tx, ty = affine_matrix[0, 2], affine_matrix[1, 2]
+        scale = np.sqrt(affine_matrix[0, 0]**2 + affine_matrix[1, 0]**2)
+        if abs(tx) > 200 or abs(ty) > 200 or scale < 0.8 or scale > 1.2:
+            return None
+
+        # Check inlier ratio — low ratio means unreliable estimation
+        if inliers is not None:
+            inlier_ratio = inliers.sum() / len(inliers)
+            if inlier_ratio < 0.4:
+                return None
+
+        return affine_matrix
+
+    def _apply_camera_motion(self, affine_matrix: np.ndarray):
+        """
+        Apply camera motion compensation to all tracked Kalman filter states.
+
+        Transforms the predicted position of each track by the estimated camera motion,
+        so that predictions account for global camera movement (pan/zoom).
+        """
+        for track_id, kf in self.kalman_filters.items():
+            # Current Kalman state: [cx, cy, s, r, vx, vy, vs, vr]
+            cx, cy = kf.x[0], kf.x[1]
+
+            # Transform center point through the affine matrix
+            pt = np.array([cx, cy, 1.0])
+            new_cx = affine_matrix[0] @ pt
+            new_cy = affine_matrix[1] @ pt
+
+            # Extract rotation+scale submatrix for velocity transform
+            R = affine_matrix[:2, :2]
+            scale = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
+
+            # Update position
+            kf.x[0] = new_cx
+            kf.x[1] = new_cy
+
+            # Scale the area (s) by scale²
+            kf.x[2] *= scale * scale
+
+            # Transform velocity by the rotation+scale matrix
+            vx, vy = kf.x[4], kf.x[5]
+            kf.x[4] = R[0, 0] * vx + R[0, 1] * vy
+            kf.x[5] = R[1, 0] * vx + R[1, 1] * vy
+
+            # Scale area velocity
+            kf.x[6] *= scale * scale
+
+            # Update the track bbox from the compensated state
+            if track_id in self.tracks:
+                self.tracks[track_id].bbox = kf.get_state()
 
     async def update(
         self,
@@ -220,13 +340,26 @@ class TrackingService:
                 low_dets.append(d)
                 low_hists.append(det_histograms[i])
 
+        # Estimate and apply camera motion compensation BEFORE prediction
+        # This shifts all track positions by the global camera movement,
+        # so Kalman predictions start from the correct compensated position
+        if frame is not None and self.tracks:
+            affine_matrix = self._estimate_camera_motion(frame)
+            if affine_matrix is not None:
+                self._apply_camera_motion(affine_matrix)
+        elif frame is not None:
+            # Still update prev_gray even if no tracks yet
+            self._estimate_camera_motion(frame)
+
         # Predict new locations for existing tracks
         for track_id, kf in self.kalman_filters.items():
             self.tracks[track_id].bbox = kf.predict()
 
         # Get active and lost tracks
-        active_tracks = {tid: t for tid, t in self.tracks.items() if t.time_since_update < 1}
-        lost_tracks = {tid: t for tid, t in self.tracks.items() if 1 <= t.time_since_update < self.track_buffer}
+        # Note: time_since_update is incremented at end of frame, so tracks matched
+        # last frame have tsu=1. Use <= 1 to include them as "active".
+        active_tracks = {tid: t for tid, t in self.tracks.items() if t.time_since_update <= 1}
+        lost_tracks = {tid: t for tid, t in self.tracks.items() if 1 < t.time_since_update < self.track_buffer}
 
         # Match high confidence detections to active tracks
         matched_high, unmatched_tracks, unmatched_dets = self._match_detections(
@@ -659,3 +792,4 @@ class TrackingService:
         self.graveyard.clear()
         self.next_id = 1
         self.frame_count = 0
+        self.prev_gray = None

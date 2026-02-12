@@ -53,7 +53,7 @@ class Settings(BaseSettings):
 
     # Tracking Tuning
     TRACKING_IOU_THRESHOLD: float = 0.8       # Match threshold (1 - min_iou)
-    TRACKING_MAX_INTERPOLATION_FRAMES: int = 15  # Max frames to interpolate lost tracks
+    TRACKING_MAX_INTERPOLATION_FRAMES: int = 3   # Max frames to interpolate lost tracks (keep low for panning cameras)
     TRACKING_INTERPOLATION_CONFIDENCE_DECAY: float = 0.04  # Confidence decay per interpolated frame
 
     # Team Classification Tuning
