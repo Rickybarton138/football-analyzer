@@ -1,8 +1,12 @@
 """
 Ball Detection Service
 
-Specialized detection for the football using motion analysis
-and deep learning inference.
+Specialized detection for the football using SAHI sliced inference
+as primary method, with fallback to standard YOLO, motion-based,
+and color-based detection.
+
+Includes parabolic interpolation for aerial balls and adaptive
+Kalman filtering.
 """
 import numpy as np
 import cv2
@@ -17,28 +21,32 @@ class BallDetectionService:
     """
     Service for detecting and tracking the football.
 
-    Combines multiple approaches:
-    1. YOLO detection for sports ball class
-    2. Motion-based detection for fast-moving ball
-    3. Color-based detection as fallback
-    4. Kalman filtering for trajectory prediction
+    Detection pipeline (in priority order):
+    1. SAHI sliced inference (primary - catches small/distant balls)
+    2. Standard YOLO detection (fast fallback)
+    3. Motion-based detection
+    4. Color-based detection
+    5. Kalman prediction + parabolic interpolation
     """
 
     def __init__(self):
         self.model = None
         self.prev_frame: Optional[np.ndarray] = None
-        self.prev_positions: deque = deque(maxlen=10)  # Last 10 ball positions
+        self.prev_positions: deque = deque(maxlen=30)  # Increased for interpolation
         self.kalman = self._init_kalman_filter()
+        self._sahi_available = False
+        self._frames_since_detection = 0
+        self._is_aerial = False  # Track if ball is in aerial trajectory
 
         # Ball appearance parameters
-        self.ball_min_radius = 5  # pixels
-        self.ball_max_radius = 30  # pixels
-        self.ball_color_lower = np.array([0, 0, 200])  # White ball lower bound (BGR)
-        self.ball_color_upper = np.array([180, 30, 255])  # White ball upper bound
+        self.ball_min_radius = 5
+        self.ball_max_radius = 30
+        self.ball_color_lower = np.array([0, 0, 200])
+        self.ball_color_upper = np.array([180, 30, 255])
 
     def _init_kalman_filter(self):
-        """Initialize Kalman filter for ball tracking."""
-        kalman = cv2.KalmanFilter(4, 2)  # 4 state vars (x, y, vx, vy), 2 measurements (x, y)
+        """Initialize adaptive Kalman filter for ball tracking."""
+        kalman = cv2.KalmanFilter(4, 2)
 
         kalman.measurementMatrix = np.array([
             [1, 0, 0, 0],
@@ -52,26 +60,47 @@ class BallDetectionService:
             [0, 0, 0, 1]
         ], np.float32)
 
+        # Default noise (adjusted adaptively for aerial vs ground)
         kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
         kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
 
         return kalman
+
+    def _adapt_kalman_noise(self):
+        """Adjust Kalman noise based on whether ball is aerial or on ground."""
+        if self._is_aerial:
+            # Aerial: higher process noise (gravity affects trajectory)
+            self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.1
+            self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
+        else:
+            # Ground: lower process noise (more predictable)
+            self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+            self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
 
     async def initialize(self):
         """Initialize ball detection model."""
         try:
             from ultralytics import YOLO
 
-            # Use same model as player detection
             model_name = "yolov8s.pt" if settings.USE_GPU else "yolov8n.pt"
             self.model = YOLO(model_name)
 
             if not settings.USE_GPU:
                 self.model.to('cpu')
 
+            print("[BALL] YOLO ball detection initialized")
         except ImportError:
             print("Warning: ultralytics not installed. Using fallback ball detection.")
             self.model = None
+
+        # Check SAHI availability
+        try:
+            from sahi import AutoDetectionModel
+            self._sahi_available = True
+            print("[BALL] SAHI sliced inference available")
+        except ImportError:
+            self._sahi_available = False
+            print("[BALL] SAHI not available, using standard detection")
 
     async def detect(
         self,
@@ -90,28 +119,41 @@ class BallDetectionService:
         """
         candidates = []
 
-        # Method 1: YOLO detection
+        # Method 1: SAHI sliced inference (primary for small balls)
+        if self._sahi_available and self.model is not None:
+            sahi_ball = await self._detect_sahi(frame)
+            if sahi_ball:
+                candidates.append(("sahi", sahi_ball, 0.95))
+
+        # Method 2: Standard YOLO detection
         yolo_ball = await self._detect_yolo(frame)
         if yolo_ball:
             candidates.append(("yolo", yolo_ball, 0.9))
 
-        # Method 2: Motion-based detection
+        # Method 3: Motion-based detection
         motion_ball = await self._detect_motion(frame)
         if motion_ball:
             candidates.append(("motion", motion_ball, 0.7))
 
-        # Method 3: Color-based detection
+        # Method 4: Color-based detection
         color_ball = await self._detect_color(frame, player_boxes)
         if color_ball:
             candidates.append(("color", color_ball, 0.5))
 
-        # Method 4: Kalman prediction (if we have history)
-        predicted = self._predict_position()
-        if predicted:
-            candidates.append(("predicted", predicted, 0.3))
+        # Method 5: Parabolic interpolation for aerial balls
+        if not candidates and self._frames_since_detection <= settings.BALL_MAX_INTERPOLATION_GAP:
+            interp_ball = self._parabolic_interpolation()
+            if interp_ball:
+                candidates.append(("interpolated", interp_ball, 0.2))
 
-        # Select best candidate
+        # Method 6: Kalman prediction
         if not candidates:
+            predicted = self._predict_position()
+            if predicted:
+                candidates.append(("predicted", predicted, 0.1))
+
+        if not candidates:
+            self._frames_since_detection += 1
             self.prev_frame = frame.copy()
             return None
 
@@ -119,21 +161,76 @@ class BallDetectionService:
         candidates.sort(key=lambda x: x[2], reverse=True)
         best_method, best_ball, _ = candidates[0]
 
-        # Update Kalman filter
+        # Update state
         self._update_kalman(best_ball.pixel_position)
+        self._detect_aerial_state(best_ball.pixel_position)
 
-        # Calculate velocity
         velocity = self._calculate_velocity(best_ball.pixel_position)
         best_ball.velocity = velocity
 
-        # Store for next frame
         self.prev_frame = frame.copy()
-        self.prev_positions.append((best_ball.pixel_position.x, best_ball.pixel_position.y))
+        self.prev_positions.append((
+            best_ball.pixel_position.x,
+            best_ball.pixel_position.y,
+            self._frames_since_detection == 0  # True if real detection
+        ))
+        self._frames_since_detection = 0 if best_method != "interpolated" else self._frames_since_detection + 1
 
         return best_ball
 
+    async def _detect_sahi(self, frame: np.ndarray) -> Optional[DetectedBall]:
+        """Detect ball using SAHI sliced inference for small object detection."""
+        try:
+            from sahi import AutoDetectionModel
+            from sahi.predict import get_sliced_prediction
+
+            # Create SAHI detection model wrapper
+            detection_model = AutoDetectionModel.from_pretrained(
+                model_type="ultralytics",
+                model=self.model,
+                confidence_threshold=0.2,
+                device="cuda:0" if settings.USE_GPU else "cpu",
+            )
+
+            # Run sliced prediction
+            result = get_sliced_prediction(
+                image=frame,
+                detection_model=detection_model,
+                slice_height=settings.SAHI_SLICE_SIZE,
+                slice_width=settings.SAHI_SLICE_SIZE,
+                overlap_height_ratio=settings.SAHI_OVERLAP_RATIO,
+                overlap_width_ratio=settings.SAHI_OVERLAP_RATIO,
+                verbose=0,
+            )
+
+            # Find ball detections (sports ball class = 32 in COCO)
+            best_ball = None
+            best_conf = 0
+
+            for pred in result.object_prediction_list:
+                if pred.category.id == settings.SPORTS_BALL_CLASS_ID:
+                    conf = pred.score.value
+                    if conf > best_conf:
+                        best_conf = conf
+                        bbox = pred.bbox
+                        x1, y1 = int(bbox.minx), int(bbox.miny)
+                        x2, y2 = int(bbox.maxx), int(bbox.maxy)
+                        cx = (x1 + x2) // 2
+                        cy = (y1 + y2) // 2
+
+                        best_ball = DetectedBall(
+                            bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2, confidence=conf),
+                            pixel_position=PixelPosition(x=cx, y=cy)
+                        )
+
+            return best_ball
+
+        except Exception as e:
+            # SAHI failed, fall through to standard YOLO
+            return None
+
     async def _detect_yolo(self, frame: np.ndarray) -> Optional[DetectedBall]:
-        """Detect ball using YOLO."""
+        """Detect ball using standard YOLO."""
         if self.model is None:
             return None
 
@@ -149,7 +246,6 @@ class BallDetectionService:
             if boxes is None or len(boxes) == 0:
                 continue
 
-            # Get highest confidence ball detection
             best_idx = boxes.conf.argmax()
             box = boxes[best_idx]
 
@@ -171,45 +267,36 @@ class BallDetectionService:
         if self.prev_frame is None:
             return None
 
-        # Convert to grayscale
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         prev_gray = cv2.cvtColor(self.prev_frame, cv2.COLOR_BGR2GRAY)
 
-        # Ensure frames have same size (handle resolution changes)
         if gray.shape != prev_gray.shape:
             prev_gray = cv2.resize(prev_gray, (gray.shape[1], gray.shape[0]))
 
-        # Frame difference
         diff = cv2.absdiff(gray, prev_gray)
         _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
 
-        # Morphological operations to clean up
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-        # Find contours
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         ball_candidates = []
 
         for contour in contours:
             area = cv2.contourArea(contour)
-
-            # Filter by size (ball should be small)
             if area < 50 or area > 2000:
                 continue
 
-            # Check circularity
             perimeter = cv2.arcLength(contour, True)
             if perimeter == 0:
                 continue
             circularity = 4 * np.pi * area / (perimeter ** 2)
 
-            if circularity < 0.5:  # Not circular enough
+            if circularity < 0.5:
                 continue
 
-            # Get bounding circle
             (x, y), radius = cv2.minEnclosingCircle(contour)
 
             if radius < self.ball_min_radius or radius > self.ball_max_radius:
@@ -225,7 +312,6 @@ class BallDetectionService:
         if not ball_candidates:
             return None
 
-        # Select best candidate (most circular, appropriate size)
         ball_candidates.sort(key=lambda b: b["circularity"], reverse=True)
         best = ball_candidates[0]
 
@@ -246,26 +332,20 @@ class BallDetectionService:
         player_boxes: Optional[List[BoundingBox]] = None
     ) -> Optional[DetectedBall]:
         """Detect ball using color filtering."""
-        # Convert to HSV for better color detection
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # Create mask for white/bright objects
-        # Standard football is white
         lower_white = np.array([0, 0, 200])
         upper_white = np.array([180, 30, 255])
         mask = cv2.inRange(hsv, lower_white, upper_white)
 
-        # Mask out player regions
         if player_boxes:
             for box in player_boxes:
                 mask[box.y1:box.y2, box.x1:box.x2] = 0
 
-        # Morphological operations
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for contour in contours:
@@ -278,7 +358,6 @@ class BallDetectionService:
             if radius < self.ball_min_radius or radius > self.ball_max_radius:
                 continue
 
-            # Check circularity
             perimeter = cv2.arcLength(contour, True)
             if perimeter == 0:
                 continue
@@ -296,17 +375,91 @@ class BallDetectionService:
 
         return None
 
+    def _detect_aerial_state(self, position: PixelPosition):
+        """Detect if ball is in an aerial trajectory based on vertical movement."""
+        if len(self.prev_positions) < 3:
+            self._is_aerial = False
+            return
+
+        # Check vertical acceleration (gravity indicator)
+        positions = list(self.prev_positions)
+        recent = positions[-3:]
+
+        # Calculate vertical differences
+        dy1 = recent[1][1] - recent[0][1]
+        dy2 = recent[2][1] - recent[1][1]
+
+        # If vertical acceleration is consistent (ball going up then down), it's aerial
+        # Gravity causes increasing downward velocity
+        vertical_accel = dy2 - dy1
+        self._is_aerial = abs(vertical_accel) > 2  # Pixel threshold for acceleration
+
+        self._adapt_kalman_noise()
+
+    def _parabolic_interpolation(self) -> Optional[DetectedBall]:
+        """
+        Interpolate ball position using parabolic (gravity-aware) trajectory.
+
+        Fits a parabola to the last known positions to predict where the
+        ball should be during aerial phases.
+        """
+        # Need at least 3 real detections for parabolic fit
+        real_positions = [(x, y) for x, y, is_real in self.prev_positions if is_real]
+
+        if len(real_positions) < 3:
+            return self._predict_position()
+
+        # Use last 5-10 real positions
+        recent = real_positions[-10:]
+        n = len(recent)
+
+        # Fit parabola: y = at² + bt + c (t = frame index)
+        t = np.arange(n, dtype=np.float64)
+        xs = np.array([p[0] for p in recent], dtype=np.float64)
+        ys = np.array([p[1] for p in recent], dtype=np.float64)
+
+        # Linear fit for x (horizontal motion is approximately linear)
+        if n >= 2:
+            x_coeffs = np.polyfit(t, xs, 1)
+        else:
+            return None
+
+        # Quadratic fit for y (vertical motion follows parabola under gravity)
+        if n >= 3:
+            y_coeffs = np.polyfit(t, ys, 2)
+        else:
+            y_coeffs = np.polyfit(t, ys, 1)
+
+        # Predict next position
+        t_pred = float(n + self._frames_since_detection)
+        pred_x = int(np.polyval(x_coeffs, t_pred))
+        pred_y = int(np.polyval(y_coeffs, t_pred))
+
+        # Validate prediction is reasonable
+        if pred_x < 0 or pred_x > 1920 or pred_y < 0 or pred_y > 1080:
+            return None
+
+        # Confidence decreases with interpolation gap
+        conf = max(0.1, 0.5 - self._frames_since_detection * 0.02)
+
+        return DetectedBall(
+            bbox=BoundingBox(
+                x1=pred_x - 10, y1=pred_y - 10,
+                x2=pred_x + 10, y2=pred_y + 10,
+                confidence=conf
+            ),
+            pixel_position=PixelPosition(x=pred_x, y=pred_y)
+        )
+
     def _predict_position(self) -> Optional[DetectedBall]:
         """Predict ball position using Kalman filter."""
         if len(self.prev_positions) < 3:
             return None
 
         prediction = self.kalman.predict()
-        # Kalman predict returns 2D array (4x1), flatten and get x,y
         pred_flat = prediction.flatten()
         x, y = int(pred_flat[0]), int(pred_flat[1])
 
-        # Validate prediction is within frame bounds (assume 1920x1080)
         if x < 0 or x > 1920 or y < 0 or y > 1080:
             return None
 
@@ -328,16 +481,14 @@ class BallDetectionService:
         if len(self.prev_positions) < 2:
             return None
 
-        prev_x, prev_y = self.prev_positions[-1]
+        prev_x, prev_y = self.prev_positions[-1][0], self.prev_positions[-1][1]
         dx = current_pos.x - prev_x
         dy = current_pos.y - prev_y
 
-        # Assume ~10 FPS for velocity calculation
         fps = settings.LIVE_FPS
-        vx = dx * fps  # pixels per second
+        vx = dx * fps
         vy = dy * fps
 
-        # Convert to approximate m/s (rough estimate: 1 pixel ≈ 0.05m at typical camera view)
         pixel_to_meter = 0.05
         vx_ms = vx * pixel_to_meter
         vy_ms = vy * pixel_to_meter
@@ -349,19 +500,18 @@ class BallDetectionService:
 
     def get_ball_trajectory(self, num_points: int = 5) -> List[Tuple[int, int]]:
         """Get recent ball trajectory points."""
-        return list(self.prev_positions)[-num_points:]
+        return [(x, y) for x, y, _ in list(self.prev_positions)[-num_points:]]
 
     def is_ball_in_motion(self, threshold_kmh: float = 5.0) -> bool:
         """Check if ball is moving above threshold speed."""
         if len(self.prev_positions) < 2:
             return False
 
-        # Simple check using last two positions
         p1 = self.prev_positions[-2]
         p2 = self.prev_positions[-1]
 
         dist_pixels = np.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
-        dist_meters = dist_pixels * 0.05  # Rough conversion
+        dist_meters = dist_pixels * 0.05
 
         speed_ms = dist_meters * settings.LIVE_FPS
         speed_kmh = speed_ms * 3.6
@@ -377,34 +527,29 @@ class BallDetectionService:
         """Draw ball detection and trajectory on frame."""
         annotated = frame.copy()
 
-        # Draw ball circle
         cv2.circle(
             annotated,
             (ball.pixel_position.x, ball.pixel_position.y),
             max(10, (ball.bbox.x2 - ball.bbox.x1) // 2),
-            (0, 255, 255),  # Yellow
-            2
+            (0, 255, 255), 2
         )
 
-        # Draw trajectory
         if draw_trajectory and len(self.prev_positions) > 1:
-            points = list(self.prev_positions)
+            points = [(x, y) for x, y, _ in self.prev_positions]
             for i in range(1, len(points)):
                 alpha = i / len(points)
                 color = (0, int(255 * alpha), int(255 * alpha))
                 cv2.line(annotated, points[i-1], points[i], color, 2)
 
-        # Draw velocity vector
         if ball.velocity and ball.velocity.speed_kmh > 5:
-            scale = 2  # Scale factor for visualization
+            scale = 2
             end_x = int(ball.pixel_position.x + ball.velocity.vx * scale)
             end_y = int(ball.pixel_position.y + ball.velocity.vy * scale)
             cv2.arrowedLine(
                 annotated,
                 (ball.pixel_position.x, ball.pixel_position.y),
                 (end_x, end_y),
-                (255, 0, 255),  # Magenta
-                2
+                (255, 0, 255), 2
             )
 
         return annotated
@@ -414,3 +559,5 @@ class BallDetectionService:
         self.prev_frame = None
         self.prev_positions.clear()
         self.kalman = self._init_kalman_filter()
+        self._frames_since_detection = 0
+        self._is_aerial = False

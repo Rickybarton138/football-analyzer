@@ -16,10 +16,22 @@ numpy>=1.24.0
 scikit-learn>=1.3.0
 scipy>=1.11.0
 
-# Deep Learning (optional - for local inference)
-# Uncomment if using local GPU processing
-# torch>=2.1.0
-# ultralytics>=8.1.0
+# Deep Learning - detection & tracking pipeline
+torch>=2.1.0
+ultralytics>=8.3.0
+
+# Roboflow supervision - detection format bridge & tracking
+supervision>=0.25.0
+
+# SAHI - sliced inference for small object (ball) detection
+sahi>=0.11.0
+
+# SigLIP team classification (vision embeddings + clustering)
+transformers>=4.40.0
+umap-learn>=0.5.5
+
+# Roboflow SDK - dataset download for fine-tuning
+roboflow>=1.1.0
 
 # OCR for jersey number recognition (choose one)
 # easyocr>=1.7.0  # Recommended - easier setup

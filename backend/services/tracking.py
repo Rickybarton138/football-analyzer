@@ -1,299 +1,88 @@
 """
 Player Tracking Service
 
-Uses ByteTrack for multi-object tracking to maintain consistent player IDs
-across frames, handling occlusions and re-identification.
+Uses supervision ByteTrack for multi-object tracking with consistent player IDs.
+Replaces the custom ByteTrack implementation with the battle-tested supervision
+library while keeping the exact same public API.
+
+Falls back to a minimal IoU tracker if supervision is not installed.
 """
 import numpy as np
 import cv2
 from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass, field
-from collections import defaultdict, deque
-from scipy.optimize import linear_sum_assignment
+from collections import defaultdict, deque, Counter
 
 from config import settings
 from models.schemas import DetectedPlayer, BoundingBox, PixelPosition, TeamSide
 
 
-@dataclass
-class TrackState:
-    """Internal state for a tracked object."""
-    track_id: int
-    bbox: np.ndarray  # [x1, y1, x2, y2]
-    score: float
-    team: TeamSide = TeamSide.UNKNOWN
-    jersey_color: Optional[List[int]] = None
-    is_goalkeeper: bool = False
-    hits: int = 0
-    age: int = 0
-    time_since_update: int = 0
-    velocity: np.ndarray = field(default_factory=lambda: np.zeros(4))
-    team_history: deque = field(default_factory=lambda: deque(maxlen=5))
-    appearance_hist: Optional[np.ndarray] = None  # HSV color histogram for re-ID
-
-
-class KalmanFilter:
-    """Simple Kalman filter for bounding box tracking."""
-
-    def __init__(self):
-        # State: [x_center, y_center, aspect_ratio, height, vx, vy, va, vh]
-        self.dim_x = 8
-        self.dim_z = 4
-
-        # State transition matrix
-        self.F = np.eye(self.dim_x)
-        self.F[:4, 4:] = np.eye(4)
-
-        # Measurement matrix
-        self.H = np.eye(self.dim_z, self.dim_x)
-
-        # Process noise
-        self.Q = np.eye(self.dim_x) * 0.01
-        self.Q[4:, 4:] *= 10
-
-        # Measurement noise
-        self.R = np.eye(self.dim_z) * 1
-
-        # State covariance
-        self.P = np.eye(self.dim_x) * 10
-
-        # State
-        self.x = np.zeros(self.dim_x)
-
-    def initialize(self, bbox: np.ndarray):
-        """Initialize state from bounding box [x1, y1, x2, y2]."""
-        self.x[:4] = self._bbox_to_z(bbox)
-        self.x[4:] = 0
-
-    def predict(self) -> np.ndarray:
-        """Predict next state."""
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self.Q
-        return self._z_to_bbox(self.x[:4])
-
-    def update(self, bbox: np.ndarray):
-        """Update state with measurement."""
-        z = self._bbox_to_z(bbox)
-        y = z - self.H @ self.x
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-        self.x = self.x + K @ y
-        self.P = (np.eye(self.dim_x) - K @ self.H) @ self.P
-
-    def get_state(self) -> np.ndarray:
-        """Get current bounding box estimate."""
-        return self._z_to_bbox(self.x[:4])
-
-    def _bbox_to_z(self, bbox: np.ndarray) -> np.ndarray:
-        """Convert [x1, y1, x2, y2] to [cx, cy, s, r]."""
-        w = bbox[2] - bbox[0]
-        h = bbox[3] - bbox[1]
-        cx = bbox[0] + w / 2
-        cy = bbox[1] + h / 2
-        s = w * h
-        r = w / max(h, 1)
-        return np.array([cx, cy, s, r])
-
-    def _z_to_bbox(self, z: np.ndarray) -> np.ndarray:
-        """Convert [cx, cy, s, r] to [x1, y1, x2, y2]."""
-        w = np.sqrt(max(z[2] * z[3], 0))
-        h = z[2] / max(w, 1)
-        x1 = z[0] - w / 2
-        y1 = z[1] - h / 2
-        x2 = z[0] + w / 2
-        y2 = z[1] + h / 2
-        return np.array([x1, y1, x2, y2])
-
-
 class TrackingService:
     """
-    Multi-object tracking service using simplified ByteTrack algorithm.
+    Multi-object tracking service using supervision ByteTrack.
 
     Maintains consistent player IDs across frames and handles:
     - Track initialization from detections
-    - Track prediction using Kalman filter
-    - Hungarian matching for data association
-    - Track lifecycle management (birth, death)
-    - Player count validation for consistent 22-player tracking
-    - Interpolation for temporarily occluded players
+    - ByteTrack matching (high + low confidence two-pass)
+    - Team temporal smoothing (30-frame majority vote)
+    - Track history for analytics
     """
 
-    # Expected player counts
     EXPECTED_PLAYERS = 22
     MIN_EXPECTED_PLAYERS = 18
 
     def __init__(
         self,
-        track_high_thresh: float = 0.5,  # Lowered for better sensitivity
-        track_low_thresh: float = 0.1,
-        new_track_thresh: float = 0.4,  # Lowered to catch distant players
-        match_thresh: float = 0.8,  # Higher = stricter IoU matching
-        track_buffer: int = 15  # Keep lost tracks for 15 processed frames (~5s at 3fps)
+        track_activation_threshold: float = None,
+        lost_track_buffer: int = None,
+        minimum_matching_threshold: float = None,
     ):
-        self.track_high_thresh = track_high_thresh
-        self.track_low_thresh = track_low_thresh
-        self.new_track_thresh = new_track_thresh
-        self.match_thresh = match_thresh
-        self.track_buffer = track_buffer
+        self.track_activation_threshold = (
+            track_activation_threshold or settings.TRACK_ACTIVATION_THRESHOLD
+        )
+        self.lost_track_buffer = lost_track_buffer or settings.TRACK_LOST_BUFFER
+        self.minimum_matching_threshold = (
+            minimum_matching_threshold or settings.TRACK_MINIMUM_MATCHING_THRESHOLD
+        )
 
-        self.tracks: Dict[int, TrackState] = {}
-        self.kalman_filters: Dict[int, KalmanFilter] = {}
-        self.next_id = 1
         self.frame_count = 0
 
-        # Track history for analysis
+        # Track metadata (team, color, gk flag) keyed by track_id
+        self._track_meta: Dict[int, dict] = {}
+
+        # Team temporal smoothing: track_id -> deque of recent TeamSide assignments
+        self._team_history: Dict[int, deque] = defaultdict(
+            lambda: deque(maxlen=settings.TEAM_TEMPORAL_SMOOTHING_WINDOW)
+        )
+
+        # Track history for analytics: track_id -> [(frame_number, bbox_array)]
         self.track_history: Dict[int, List[Tuple[int, np.ndarray]]] = defaultdict(list)
 
         # Player count statistics for monitoring
         self.player_count_history: List[int] = []
-        self.detection_gaps: Dict[int, int] = {}  # track_id -> frames since last detection
 
-        # Graveyard for re-identification of lost tracks
-        # Stores (TrackState, death_frame) for recently dead tracks
-        self.graveyard: Dict[int, Tuple[TrackState, int]] = {}
-        self.graveyard_max_age: int = 90  # Keep dead tracks for ~30s at 3fps
+        # Initialize tracker
+        self._sv_tracker = None
+        self._sv_available = False
+        self._init_tracker()
 
-        # Camera motion compensation
-        self.prev_gray: Optional[np.ndarray] = None  # Previous frame (grayscale)
-
-    def _extract_appearance_histogram(self, frame: np.ndarray, bbox: np.ndarray) -> Optional[np.ndarray]:
-        """Extract 48-bin HSV histogram from player ROI for appearance matching."""
-        if frame is None:
-            return None
-        x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        if x2 <= x1 or y2 <= y1:
-            return None
-        roi = frame[y1:y2, x1:x2]
-        if roi.size == 0:
-            return None
-        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        # 16 bins for H, 16 for S, 16 for V = 48 total bins
-        hist_h = cv2.calcHist([hsv_roi], [0], None, [16], [0, 180])
-        hist_s = cv2.calcHist([hsv_roi], [1], None, [16], [0, 256])
-        hist_v = cv2.calcHist([hsv_roi], [2], None, [16], [0, 256])
-        hist = np.concatenate([hist_h, hist_s, hist_v]).flatten()
-        cv2.normalize(hist, hist)
-        return hist
-
-    def _estimate_camera_motion(self, frame: np.ndarray) -> Optional[np.ndarray]:
-        """
-        Estimate global camera motion between previous and current frame.
-
-        Uses sparse optical flow on background features + RANSAC affine estimation
-        to compute the 2x3 affine transform representing camera pan/zoom/rotation.
-
-        Returns:
-            2x3 affine matrix if successful, None if estimation failed.
-        """
-        if frame is None:
-            return None
-
-        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        if self.prev_gray is None:
-            self.prev_gray = curr_gray
-            return None
-
-        # Find good features to track in the previous frame
-        # Use a coarse grid to get well-distributed points (mostly background/pitch)
-        prev_pts = cv2.goodFeaturesToTrack(
-            self.prev_gray,
-            maxCorners=200,
-            qualityLevel=0.01,
-            minDistance=30,
-            blockSize=7
-        )
-
-        if prev_pts is None or len(prev_pts) < 10:
-            self.prev_gray = curr_gray
-            return None
-
-        # Track features to current frame using Lucas-Kanade optical flow
-        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-            self.prev_gray, curr_gray, prev_pts, None,
-            winSize=(21, 21),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-        )
-
-        # Filter to successfully tracked points
-        good_mask = status.flatten() == 1
-        if good_mask.sum() < 6:
-            self.prev_gray = curr_gray
-            return None
-
-        prev_good = prev_pts[good_mask]
-        curr_good = curr_pts[good_mask]
-
-        # Estimate partial affine (translation + rotation + uniform scale)
-        # RANSAC automatically rejects outliers (points on moving players)
-        affine_matrix, inliers = cv2.estimateAffinePartial2D(
-            prev_good, curr_good,
-            method=cv2.RANSAC,
-            ransacReprojThreshold=5.0
-        )
-
-        self.prev_gray = curr_gray
-
-        if affine_matrix is None:
-            return None
-
-        # Validate: reject if too extreme (corrupt estimation)
-        # Extract translation and scale
-        tx, ty = affine_matrix[0, 2], affine_matrix[1, 2]
-        scale = np.sqrt(affine_matrix[0, 0]**2 + affine_matrix[1, 0]**2)
-        if abs(tx) > 200 or abs(ty) > 200 or scale < 0.8 or scale > 1.2:
-            return None
-
-        # Check inlier ratio — low ratio means unreliable estimation
-        if inliers is not None:
-            inlier_ratio = inliers.sum() / len(inliers)
-            if inlier_ratio < 0.4:
-                return None
-
-        return affine_matrix
-
-    def _apply_camera_motion(self, affine_matrix: np.ndarray):
-        """
-        Apply camera motion compensation to all tracked Kalman filter states.
-
-        Transforms the predicted position of each track by the estimated camera motion,
-        so that predictions account for global camera movement (pan/zoom).
-        """
-        for track_id, kf in self.kalman_filters.items():
-            # Current Kalman state: [cx, cy, s, r, vx, vy, vs, vr]
-            cx, cy = kf.x[0], kf.x[1]
-
-            # Transform center point through the affine matrix
-            pt = np.array([cx, cy, 1.0])
-            new_cx = affine_matrix[0] @ pt
-            new_cy = affine_matrix[1] @ pt
-
-            # Extract rotation+scale submatrix for velocity transform
-            R = affine_matrix[:2, :2]
-            scale = np.sqrt(R[0, 0]**2 + R[1, 0]**2)
-
-            # Update position
-            kf.x[0] = new_cx
-            kf.x[1] = new_cy
-
-            # Scale the area (s) by scale²
-            kf.x[2] *= scale * scale
-
-            # Transform velocity by the rotation+scale matrix
-            vx, vy = kf.x[4], kf.x[5]
-            kf.x[4] = R[0, 0] * vx + R[0, 1] * vy
-            kf.x[5] = R[1, 0] * vx + R[1, 1] * vy
-
-            # Scale area velocity
-            kf.x[6] *= scale * scale
-
-            # Update the track bbox from the compensated state
-            if track_id in self.tracks:
-                self.tracks[track_id].bbox = kf.get_state()
+    def _init_tracker(self):
+        """Initialize supervision ByteTrack or fallback."""
+        try:
+            import supervision as sv
+            self._sv_tracker = sv.ByteTrack(
+                track_activation_threshold=self.track_activation_threshold,
+                lost_track_buffer=self.lost_track_buffer,
+                minimum_matching_threshold=self.minimum_matching_threshold,
+                frame_rate=30,
+            )
+            self._sv_available = True
+            print(f"[TRACKING] supervision ByteTrack initialized "
+                  f"(buffer={self.lost_track_buffer}, thresh={self.minimum_matching_threshold})")
+        except ImportError:
+            print("[TRACKING] supervision not available, using minimal IoU fallback tracker")
+            self._sv_available = False
+            self._fallback_next_id = 1
+            self._fallback_tracks: Dict[int, dict] = {}
 
     async def update(
         self,
@@ -304,349 +93,223 @@ class TrackingService:
         """
         Update tracks with new detections.
 
-        Enhanced to include interpolated positions for temporarily lost tracks
-        to maintain consistent 22-player tracking.
-
         Args:
             detections: List of detected players (without track IDs)
             frame_number: Current frame number
-            frame: Optional BGR frame for appearance feature extraction
+            frame: Optional BGR frame (kept for API compat, not used by ByteTrack)
 
         Returns:
-            List of detected players with assigned track IDs (including interpolated)
+            List of detected players with assigned track IDs
         """
         self.frame_count = frame_number
 
-        # Extract appearance histograms for all detections (if frame available)
-        det_histograms = []
-        if frame is not None:
-            for det in detections:
-                bbox = self._det_to_bbox(det)
-                hist = self._extract_appearance_histogram(frame, bbox)
-                det_histograms.append(hist)
+        if not detections:
+            self.player_count_history.append(0)
+            return []
+
+        if self._sv_available:
+            tracked = self._update_supervision(detections)
         else:
-            det_histograms = [None] * len(detections)
+            tracked = self._update_fallback(detections)
 
-        # Separate high and low confidence detections (with their histograms)
-        high_dets = []
-        high_hists = []
-        low_dets = []
-        low_hists = []
-        for i, d in enumerate(detections):
-            if d.bbox.confidence >= self.track_high_thresh:
-                high_dets.append(d)
-                high_hists.append(det_histograms[i])
-            else:
-                low_dets.append(d)
-                low_hists.append(det_histograms[i])
+        # Apply team temporal smoothing to all tracked players
+        for player in tracked:
+            if player.track_id >= 0:
+                player.team = self._smooth_team(player.track_id, player.team)
 
-        # Estimate and apply camera motion compensation BEFORE prediction
-        # This shifts all track positions by the global camera movement,
-        # so Kalman predictions start from the correct compensated position
-        if frame is not None and self.tracks:
-            affine_matrix = self._estimate_camera_motion(frame)
-            if affine_matrix is not None:
-                self._apply_camera_motion(affine_matrix)
-        elif frame is not None:
-            # Still update prev_gray even if no tracks yet
-            self._estimate_camera_motion(frame)
+                # Update track metadata
+                self._track_meta[player.track_id] = {
+                    "team": player.team,
+                    "jersey_color": player.jersey_color,
+                    "is_goalkeeper": player.is_goalkeeper,
+                }
 
-        # Predict new locations for existing tracks
-        for track_id, kf in self.kalman_filters.items():
-            self.tracks[track_id].bbox = kf.predict()
+                # Store in history
+                bbox_arr = np.array([
+                    player.bbox.x1, player.bbox.y1,
+                    player.bbox.x2, player.bbox.y2
+                ])
+                self.track_history[player.track_id].append(
+                    (frame_number, bbox_arr)
+                )
 
-        # Get active and lost tracks
-        # Note: time_since_update is incremented at end of frame, so tracks matched
-        # last frame have tsu=1. Use <= 1 to include them as "active".
-        active_tracks = {tid: t for tid, t in self.tracks.items() if t.time_since_update <= 1}
-        lost_tracks = {tid: t for tid, t in self.tracks.items() if 1 < t.time_since_update < self.track_buffer}
+        self.player_count_history.append(len(tracked))
+        return tracked
 
-        # Match high confidence detections to active tracks
-        matched_high, unmatched_tracks, unmatched_dets = self._match_detections(
-            list(active_tracks.values()),
-            high_dets,
-            det_histograms=high_hists
+    def _update_supervision(self, detections: List[DetectedPlayer]) -> List[DetectedPlayer]:
+        """Update tracking using supervision ByteTrack."""
+        import supervision as sv
+
+        # Build numpy arrays for supervision Detections
+        n = len(detections)
+        xyxy = np.zeros((n, 4), dtype=np.float32)
+        confidence = np.zeros(n, dtype=np.float32)
+        class_id = np.zeros(n, dtype=int)
+
+        for i, det in enumerate(detections):
+            xyxy[i] = [det.bbox.x1, det.bbox.y1, det.bbox.x2, det.bbox.y2]
+            confidence[i] = det.bbox.confidence
+            class_id[i] = 0  # All players are class 0 for tracking
+
+        sv_dets = sv.Detections(
+            xyxy=xyxy,
+            confidence=confidence,
+            class_id=class_id,
         )
 
-        # Update matched tracks
+        # Run ByteTrack
+        tracked_dets = self._sv_tracker.update_with_detections(sv_dets)
+
+        # Map tracked results back to DetectedPlayer objects
         tracked_players = []
-        matched_track_ids = set()
+        for i in range(len(tracked_dets)):
+            x1, y1, x2, y2 = tracked_dets.xyxy[i].astype(int)
+            conf = float(tracked_dets.confidence[i])
+            track_id = int(tracked_dets.tracker_id[i])
 
-        for track, det in matched_high:
-            det_idx = high_dets.index(det)
-            self._update_track(track, det)
-            # Update appearance histogram
-            if det_idx < len(high_hists) and high_hists[det_idx] is not None:
-                track.appearance_hist = high_hists[det_idx]
-            tracked_players.append(self._track_to_player(track, det))
-            matched_track_ids.add(track.track_id)
+            # Find the best matching original detection for metadata
+            best_det = self._find_closest_detection(
+                x1, y1, x2, y2, detections
+            )
 
-        # Try to match remaining tracks with low confidence detections
-        remaining_tracks = [self.tracks[tid] for tid in unmatched_tracks if tid in active_tracks]
-        matched_low, _, remaining_low_dets = self._match_detections(
-            remaining_tracks,
-            low_dets,
-            det_histograms=low_hists
-        )
+            team = best_det.team if best_det else TeamSide.UNKNOWN
+            jersey_color = best_det.jersey_color if best_det else None
+            is_gk = best_det.is_goalkeeper if best_det else False
 
-        for track, det in matched_low:
-            self._update_track(track, det)
-            tracked_players.append(self._track_to_player(track, det))
-            matched_track_ids.add(track.track_id)
+            # Inherit metadata from track history if detection is ambiguous
+            if team == TeamSide.UNKNOWN and track_id in self._track_meta:
+                meta = self._track_meta[track_id]
+                team = meta.get("team", TeamSide.UNKNOWN)
+                if jersey_color is None:
+                    jersey_color = meta.get("jersey_color")
+                if not is_gk:
+                    is_gk = meta.get("is_goalkeeper", False)
 
-        # Try to recover lost tracks with unmatched high detections
-        lost_track_list = list(lost_tracks.values())
-        unmatched_high_dets = [high_dets[i] for i in unmatched_dets]
-        unmatched_high_hists = [high_hists[i] for i in unmatched_dets]
-        matched_lost, _, final_unmatched = self._match_detections(
-            lost_track_list,
-            unmatched_high_dets,
-            det_histograms=unmatched_high_hists
-        )
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
 
-        for track, det in matched_lost:
-            self._update_track(track, det)
-            tracked_players.append(self._track_to_player(track, det))
-            matched_track_ids.add(track.track_id)
-
-        # Create new tracks for unmatched high confidence detections
-        # First attempt re-identification from graveyard
-        for idx in final_unmatched:
-            det = unmatched_high_dets[idx]
-            if det.bbox.confidence >= self.new_track_thresh:
-                det_hist = unmatched_high_hists[idx] if idx < len(unmatched_high_hists) else None
-                det_bbox = self._det_to_bbox(det)
-
-                # Try to match against graveyard tracks
-                revived_track = self._try_reidentify(det, det_bbox, det_hist)
-
-                if revived_track is not None:
-                    # Revive the track with its original ID
-                    self._update_track(revived_track, det)
-                    if det_hist is not None:
-                        revived_track.appearance_hist = det_hist
-                    tracked_players.append(self._track_to_player(revived_track, det))
-                    matched_track_ids.add(revived_track.track_id)
-                else:
-                    # Create brand new track
-                    new_track = self._create_track(det)
-                    if det_hist is not None:
-                        new_track.appearance_hist = det_hist
-                    tracked_players.append(self._track_to_player(new_track, det))
-                    matched_track_ids.add(new_track.track_id)
-
-        # Add interpolated positions for recently lost tracks
-        # This helps maintain 22-player visibility even during brief occlusions
-        interpolated_players = self._get_interpolated_players(matched_track_ids)
-        tracked_players.extend(interpolated_players)
-
-        # Age all tracks
-        for track_id in list(self.tracks.keys()):
-            track = self.tracks[track_id]
-            track.age += 1
-            track.time_since_update += 1
-
-            # Move dead tracks to graveyard instead of deleting
-            if track.time_since_update > self.track_buffer:
-                self.graveyard[track_id] = (track, self.frame_count)
-                del self.tracks[track_id]
-                if track_id in self.kalman_filters:
-                    del self.kalman_filters[track_id]
-
-        # Clean old graveyard entries
-        for gid in list(self.graveyard.keys()):
-            _, death_frame = self.graveyard[gid]
-            if self.frame_count - death_frame > self.graveyard_max_age:
-                del self.graveyard[gid]
-
-        # Track player count for monitoring
-        self.player_count_history.append(len(tracked_players))
+            player = DetectedPlayer(
+                track_id=track_id,
+                bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2, confidence=conf),
+                pixel_position=PixelPosition(x=center_x, y=center_y),
+                team=team,
+                jersey_color=jersey_color,
+                is_goalkeeper=is_gk,
+            )
+            tracked_players.append(player)
 
         return tracked_players
 
-    def _try_reidentify(
-        self,
-        det: DetectedPlayer,
-        det_bbox: np.ndarray,
-        det_hist: Optional[np.ndarray]
-    ) -> Optional[TrackState]:
-        """
-        Attempt to re-identify a detection as a previously lost track from the graveyard.
+    def _update_fallback(self, detections: List[DetectedPlayer]) -> List[DetectedPlayer]:
+        """Minimal IoU-based tracking fallback when supervision is not available."""
+        tracked_players = []
 
-        Uses appearance (histogram) + spatial proximity to match.
-        Returns the revived TrackState or None.
-        """
-        if not self.graveyard:
-            return None
+        # Simple greedy IoU matching
+        det_bboxes = []
+        for det in detections:
+            det_bboxes.append(np.array([det.bbox.x1, det.bbox.y1, det.bbox.x2, det.bbox.y2]))
 
-        best_match_id = None
-        best_score = float('inf')
-
-        for gid, (grave_track, death_frame) in self.graveyard.items():
-            # Spatial distance from last known position
-            spatial_dist = np.linalg.norm(det_bbox[:2] - grave_track.bbox[:2])
-            if spatial_dist > 300:  # Too far away
-                continue
-
-            # Team must match
-            if det.team != TeamSide.UNKNOWN and grave_track.team != TeamSide.UNKNOWN:
-                if det.team != grave_track.team:
-                    continue
-
-            # Appearance similarity
-            appearance_dist = 1.0
-            if det_hist is not None and grave_track.appearance_hist is not None:
-                appearance_dist = cv2.compareHist(
-                    grave_track.appearance_hist.astype(np.float32),
-                    det_hist.astype(np.float32),
-                    cv2.HISTCMP_BHATTACHARYYA
-                )
-
-            # Combined score: spatial + appearance
-            score = 0.5 * (spatial_dist / 300.0) + 0.5 * appearance_dist
-            if score < best_score and score < 0.6:  # Threshold for re-ID
-                best_score = score
-                best_match_id = gid
-
-        if best_match_id is not None:
-            revived_track, _ = self.graveyard.pop(best_match_id)
-            # Re-initialize Kalman filter for the revived track
-            kf = KalmanFilter()
-            kf.initialize(det_bbox)
-            self.kalman_filters[revived_track.track_id] = kf
-            self.tracks[revived_track.track_id] = revived_track
-            revived_track.time_since_update = 0
-            return revived_track
-
-        return None
-
-    def _get_interpolated_players(
-        self,
-        matched_track_ids: set,
-        max_interpolation_frames: int = None
-    ) -> List[DetectedPlayer]:
-        """
-        Get interpolated positions for tracks that weren't matched this frame.
-
-        Uses Kalman filter predictions to estimate where lost players are,
-        helping maintain consistent 22-player tracking during brief occlusions.
-        """
-        if max_interpolation_frames is None:
-            max_interpolation_frames = settings.TRACKING_MAX_INTERPOLATION_FRAMES
-        interpolated = []
-
-        for track_id, track in self.tracks.items():
-            # Skip tracks that were just matched
-            if track_id in matched_track_ids:
-                continue
-
-            # Only interpolate recently lost tracks (not too old)
-            if track.time_since_update > 0 and track.time_since_update <= max_interpolation_frames:
-                # Use Kalman prediction for position
-                if track_id in self.kalman_filters:
-                    predicted_bbox = self.kalman_filters[track_id].get_state()
-
-                    # Convert to int coordinates
-                    x1 = int(float(predicted_bbox[0]))
-                    y1 = int(float(predicted_bbox[1]))
-                    x2 = int(float(predicted_bbox[2]))
-                    y2 = int(float(predicted_bbox[3]))
-
-                    # Lower confidence for interpolated detections
-                    # Decreases with time since last real detection
-                    interp_confidence = max(0.3, 0.8 - (track.time_since_update * settings.TRACKING_INTERPOLATION_CONFIDENCE_DECAY))
-
-                    player = DetectedPlayer(
-                        track_id=track_id,
-                        bbox=BoundingBox(
-                            x1=x1, y1=y1, x2=x2, y2=y2,
-                            confidence=interp_confidence
-                        ),
-                        pixel_position=PixelPosition(
-                            x=int((x1 + x2) / 2),
-                            y=int((y1 + y2) / 2)
-                        ),
-                        team=track.team,
-                        jersey_color=track.jersey_color,
-                        is_goalkeeper=track.is_goalkeeper
-                    )
-                    interpolated.append(player)
-
-        return interpolated
-
-    def get_player_count_stats(self) -> Dict:
-        """Get statistics about player detection counts."""
-        if not self.player_count_history:
-            return {"avg": 0, "min": 0, "max": 0, "current": 0}
-
-        return {
-            "avg": sum(self.player_count_history) / len(self.player_count_history),
-            "min": min(self.player_count_history),
-            "max": max(self.player_count_history),
-            "current": self.player_count_history[-1] if self.player_count_history else 0,
-            "frames_below_22": sum(1 for c in self.player_count_history if c < 22),
-            "total_frames": len(self.player_count_history)
-        }
-
-    def _match_detections(
-        self,
-        tracks: List[TrackState],
-        detections: List[DetectedPlayer],
-        det_histograms: Optional[List[Optional[np.ndarray]]] = None
-    ) -> Tuple[List[Tuple[TrackState, DetectedPlayer]], List[int], List[int]]:
-        """
-        Match detections to tracks using Hungarian algorithm on combined
-        IoU + appearance cost matrix.
-
-        Returns:
-            - List of (track, detection) matches
-            - List of unmatched track IDs
-            - List of unmatched detection indices
-        """
-        if not tracks or not detections:
-            unmatched_tracks = [t.track_id for t in tracks]
-            unmatched_dets = list(range(len(detections)))
-            return [], unmatched_tracks, unmatched_dets
-
-        # Calculate combined cost matrix
-        cost_matrix = np.zeros((len(tracks), len(detections)))
-        for i, track in enumerate(tracks):
-            for j, det in enumerate(detections):
-                iou = self._calculate_iou(track.bbox, self._det_to_bbox(det))
-                iou_cost = 1.0 - iou
-
-                # Appearance cost via Bhattacharyya distance on HSV histograms
-                appearance_cost = 1.0  # Default high cost if no histograms
-                if (det_histograms is not None and
-                    j < len(det_histograms) and det_histograms[j] is not None and
-                    track.appearance_hist is not None):
-                    bhatt_dist = cv2.compareHist(
-                        track.appearance_hist.astype(np.float32),
-                        det_histograms[j].astype(np.float32),
-                        cv2.HISTCMP_BHATTACHARYYA
-                    )
-                    appearance_cost = bhatt_dist
-
-                # Combined cost: weighted IoU + appearance
-                cost_matrix[i, j] = 0.7 * iou_cost + 0.3 * appearance_cost
-
-        # Hungarian algorithm for optimal assignment
-        row_indices, col_indices = linear_sum_assignment(cost_matrix)
-
-        matches = []
         matched_tracks = set()
         matched_dets = set()
+        matches = []
 
-        for i, j in zip(row_indices, col_indices):
-            if cost_matrix[i, j] <= self.match_thresh:
-                matches.append((tracks[i], detections[j]))
-                matched_tracks.add(i)
-                matched_dets.add(j)
+        # Match existing tracks to detections by IoU
+        for tid, track in self._fallback_tracks.items():
+            best_iou = 0
+            best_idx = -1
+            for j, det_bbox in enumerate(det_bboxes):
+                if j in matched_dets:
+                    continue
+                iou = self._calculate_iou(track["bbox"], det_bbox)
+                if iou > best_iou and iou > 0.3:
+                    best_iou = iou
+                    best_idx = j
+            if best_idx >= 0:
+                matches.append((tid, best_idx))
+                matched_tracks.add(tid)
+                matched_dets.add(best_idx)
 
-        unmatched_tracks = [tracks[i].track_id for i in range(len(tracks)) if i not in matched_tracks]
-        unmatched_dets = [j for j in range(len(detections)) if j not in matched_dets]
+        # Update matched tracks
+        for tid, det_idx in matches:
+            det = detections[det_idx]
+            self._fallback_tracks[tid]["bbox"] = det_bboxes[det_idx]
+            self._fallback_tracks[tid]["age"] = 0
 
-        return matches, unmatched_tracks, unmatched_dets
+            player = DetectedPlayer(
+                track_id=tid,
+                bbox=det.bbox,
+                pixel_position=det.pixel_position,
+                team=det.team,
+                jersey_color=det.jersey_color,
+                is_goalkeeper=det.is_goalkeeper,
+            )
+            tracked_players.append(player)
+
+        # Create new tracks for unmatched detections
+        for j, det in enumerate(detections):
+            if j in matched_dets:
+                continue
+            tid = self._fallback_next_id
+            self._fallback_next_id += 1
+            self._fallback_tracks[tid] = {
+                "bbox": det_bboxes[j],
+                "age": 0,
+            }
+
+            player = DetectedPlayer(
+                track_id=tid,
+                bbox=det.bbox,
+                pixel_position=det.pixel_position,
+                team=det.team,
+                jersey_color=det.jersey_color,
+                is_goalkeeper=det.is_goalkeeper,
+            )
+            tracked_players.append(player)
+
+        # Age and remove stale tracks
+        for tid in list(self._fallback_tracks.keys()):
+            if tid not in matched_tracks:
+                self._fallback_tracks[tid]["age"] += 1
+                if self._fallback_tracks[tid]["age"] > self.lost_track_buffer:
+                    del self._fallback_tracks[tid]
+
+        return tracked_players
+
+    def _find_closest_detection(
+        self,
+        x1: int, y1: int, x2: int, y2: int,
+        detections: List[DetectedPlayer]
+    ) -> Optional[DetectedPlayer]:
+        """Find the detection with highest IoU to a tracked box."""
+        best_iou = 0
+        best_det = None
+        tracked_bbox = np.array([x1, y1, x2, y2], dtype=float)
+
+        for det in detections:
+            det_bbox = np.array([det.bbox.x1, det.bbox.y1, det.bbox.x2, det.bbox.y2], dtype=float)
+            iou = self._calculate_iou(tracked_bbox, det_bbox)
+            if iou > best_iou:
+                best_iou = iou
+                best_det = det
+
+        return best_det
+
+    def _smooth_team(self, track_id: int, current_team: TeamSide) -> TeamSide:
+        """Apply temporal smoothing to team assignment using majority vote."""
+        if current_team != TeamSide.UNKNOWN:
+            self._team_history[track_id].append(current_team)
+
+        history = self._team_history[track_id]
+        if len(history) < 2:
+            return current_team
+
+        counts = Counter(history)
+        most_common_team, most_common_count = counts.most_common(1)[0]
+
+        if most_common_count / len(history) >= settings.TEAM_CONSENSUS_THRESHOLD:
+            return most_common_team
+
+        return current_team
 
     def _calculate_iou(self, bbox1: np.ndarray, bbox2: np.ndarray) -> float:
         """Calculate Intersection over Union between two bounding boxes."""
@@ -661,120 +324,21 @@ class TrackingService:
         area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
 
         union = area1 + area2 - intersection
-
         return intersection / max(union, 1e-6)
 
-    def _det_to_bbox(self, det: DetectedPlayer) -> np.ndarray:
-        """Convert detection to bbox array."""
-        return np.array([det.bbox.x1, det.bbox.y1, det.bbox.x2, det.bbox.y2])
+    def get_player_count_stats(self) -> Dict:
+        """Get statistics about player detection counts."""
+        if not self.player_count_history:
+            return {"avg": 0, "min": 0, "max": 0, "current": 0}
 
-    def _create_track(self, det: DetectedPlayer) -> TrackState:
-        """Create new track from detection."""
-        track_id = self.next_id
-        self.next_id += 1
-
-        bbox = self._det_to_bbox(det)
-
-        track = TrackState(
-            track_id=track_id,
-            bbox=bbox,
-            score=det.bbox.confidence,
-            team=det.team,
-            jersey_color=det.jersey_color,
-            is_goalkeeper=det.is_goalkeeper,
-            hits=1,
-            age=0,
-            time_since_update=0
-        )
-
-        self.tracks[track_id] = track
-
-        # Initialize Kalman filter
-        kf = KalmanFilter()
-        kf.initialize(bbox)
-        self.kalman_filters[track_id] = kf
-
-        # Save to history
-        self.track_history[track_id].append((self.frame_count, bbox.copy()))
-
-        return track
-
-    def _update_track(self, track: TrackState, det: DetectedPlayer):
-        """Update existing track with new detection."""
-        bbox = self._det_to_bbox(det)
-
-        # Update Kalman filter with adaptive noise parameters
-        if track.track_id in self.kalman_filters:
-            kf = self.kalman_filters[track.track_id]
-
-            # Adaptive R: scale measurement noise inversely with detection confidence
-            # High confidence detection → lower measurement noise → trust detection more
-            confidence = det.bbox.confidence
-            r_scale = max(0.1, 1.0 / (confidence + 0.01))
-            kf.R = np.eye(kf.dim_z) * r_scale
-
-            # Adaptive Q: scale process noise with estimated velocity (sprinting → higher noise)
-            velocity_magnitude = np.linalg.norm(kf.x[4:])
-            q_scale = 0.01 + velocity_magnitude * 0.005  # More noise for fast players
-            kf.Q = np.eye(kf.dim_x) * q_scale
-            kf.Q[4:, 4:] *= 10  # Velocity components have higher uncertainty
-
-            kf.update(bbox)
-            track.bbox = kf.get_state()
-        else:
-            track.bbox = bbox
-
-        track.score = det.bbox.confidence
-        track.hits += 1
-        track.time_since_update = 0
-
-        # Temporal team smoothing via majority vote
-        if det.team != TeamSide.UNKNOWN:
-            track.team_history.append(det.team)
-            # Use majority vote over recent frames
-            if len(track.team_history) >= 2:
-                from collections import Counter
-                counts = Counter(track.team_history)
-                most_common_team, most_common_count = counts.most_common(1)[0]
-                if most_common_count / len(track.team_history) >= settings.TEAM_CONSENSUS_THRESHOLD:
-                    track.team = most_common_team
-            else:
-                track.team = det.team
-        if det.jersey_color:
-            track.jersey_color = det.jersey_color
-        track.is_goalkeeper = det.is_goalkeeper
-
-        # Save to history
-        self.track_history[track.track_id].append((self.frame_count, track.bbox.copy()))
-
-    def _track_to_player(self, track: TrackState, det: DetectedPlayer) -> DetectedPlayer:
-        """Convert track state back to DetectedPlayer with track ID."""
-        bbox = track.bbox
-
-        # Convert numpy values to Python scalars
-        x1 = int(float(bbox[0]))
-        y1 = int(float(bbox[1]))
-        x2 = int(float(bbox[2]))
-        y2 = int(float(bbox[3]))
-
-        return DetectedPlayer(
-            track_id=track.track_id,
-            bbox=BoundingBox(
-                x1=x1,
-                y1=y1,
-                x2=x2,
-                y2=y2,
-                confidence=float(track.score)
-            ),
-            pixel_position=PixelPosition(
-                x=int((x1 + x2) / 2),
-                y=int((y1 + y2) / 2)
-            ),
-            pitch_position=det.pitch_position,
-            team=track.team,
-            jersey_color=track.jersey_color,
-            is_goalkeeper=track.is_goalkeeper
-        )
+        return {
+            "avg": sum(self.player_count_history) / len(self.player_count_history),
+            "min": min(self.player_count_history),
+            "max": max(self.player_count_history),
+            "current": self.player_count_history[-1] if self.player_count_history else 0,
+            "frames_below_22": sum(1 for c in self.player_count_history if c < 22),
+            "total_frames": len(self.player_count_history),
+        }
 
     def get_track_history(self, track_id: int) -> List[Tuple[int, np.ndarray]]:
         """Get position history for a track."""
@@ -782,14 +346,26 @@ class TrackingService:
 
     def get_active_track_ids(self) -> List[int]:
         """Get IDs of currently active tracks."""
-        return [tid for tid, t in self.tracks.items() if t.time_since_update < 3]
+        if self._sv_available:
+            # Return track IDs seen in recent frames
+            recent = set()
+            for tid, history in self.track_history.items():
+                if history and self.frame_count - history[-1][0] < 3:
+                    recent.add(tid)
+            return list(recent)
+        else:
+            return list(self._fallback_tracks.keys())
 
     def reset(self):
         """Reset all tracking state."""
-        self.tracks.clear()
-        self.kalman_filters.clear()
         self.track_history.clear()
-        self.graveyard.clear()
-        self.next_id = 1
+        self.player_count_history.clear()
+        self._track_meta.clear()
+        self._team_history.clear()
         self.frame_count = 0
-        self.prev_gray = None
+
+        if self._sv_available:
+            self._init_tracker()
+        else:
+            self._fallback_next_id = 1
+            self._fallback_tracks.clear()

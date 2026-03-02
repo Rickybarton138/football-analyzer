@@ -10,6 +10,9 @@ VEO SIDELINE CAMERA PERSPECTIVE:
 - Video Y-axis (0-1080) = pitch WIDTH (far touchline at top, near touchline at bottom)
 - Perspective distortion: players far from camera appear smaller/closer together
 - Homography transformation corrects for this distortion
+
+Supports ML-based auto-calibration via pitch keypoint detection (superior)
+with fallback to Hough-line based detection.
 """
 import numpy as np
 import cv2
@@ -49,6 +52,7 @@ class PitchMapper:
         self.homography_matrix: Optional[np.ndarray] = None
         self.inverse_homography: Optional[np.ndarray] = None
         self.calibration_points: List[PitchKeypoint] = []
+        self._keypoint_detector = None  # Lazy init for ML calibration
 
         # Standard pitch dimensions in meters
         self.pitch_length = settings.PITCH_LENGTH  # 105m
@@ -372,6 +376,55 @@ class PitchMapper:
         corner_pixels = [PixelPosition(x=int(c[0]), y=int(c[1])) for c in corners]
         await self.calibrate(corner_pixels)
 
+        return True
+
+    async def auto_calibrate_ml(self, frame: np.ndarray) -> bool:
+        """
+        Automatically calibrate pitch mapping using ML keypoint detection.
+
+        Superior to Hough-line based auto_calibrate() - detects specific
+        pitch landmarks (corners, penalty spots, center circle, etc.)
+        and computes a more accurate homography.
+
+        Falls back to auto_calibrate() if keypoint model not available.
+
+        Args:
+            frame: Video frame as numpy array
+
+        Returns:
+            True if calibration successful
+        """
+        # Lazy-init keypoint detector
+        if self._keypoint_detector is None:
+            try:
+                from services.pitch_keypoint_detector import PitchKeypointDetector
+                self._keypoint_detector = PitchKeypointDetector()
+            except ImportError:
+                print("[PITCH] Keypoint detector not available, falling back to Hough lines")
+                return await self.auto_calibrate(frame)
+
+        # Detect keypoints
+        detected = self._keypoint_detector.detect_keypoints(frame)
+
+        if len(detected) < 4:
+            print(f"[PITCH] Only {len(detected)} keypoints found, falling back to Hough lines")
+            return await self.auto_calibrate(frame)
+
+        # Compute homography from keypoints
+        H = self._keypoint_detector.compute_homography(detected)
+
+        if H is None:
+            print("[PITCH] Keypoint homography failed, falling back to Hough lines")
+            return await self.auto_calibrate(frame)
+
+        self.homography_matrix = H
+
+        try:
+            self.inverse_homography = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            self.inverse_homography = None
+
+        print(f"[PITCH] ML calibration successful with {len(detected)} keypoints")
         return True
 
     def _line_intersection(

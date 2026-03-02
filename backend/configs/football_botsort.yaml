@@ -1,0 +1,20 @@
+# Football-optimized BoT-SORT / ByteTrack configuration
+# Used by supervision ByteTrack tracker
+
+# Track activation: minimum detection confidence to create a new track
+track_activation_threshold: 0.25
+
+# Lost track buffer: frames to keep a lost track before deletion
+# At 30fps, 60 frames = 2 seconds of occlusion tolerance
+lost_track_buffer: 60
+
+# Minimum matching threshold: minimum IoU for track-detection association
+# Higher = stricter matching, fewer ID switches but more fragmentation
+minimum_matching_threshold: 0.85
+
+# Frame rate: used internally for buffer calculations
+frame_rate: 30
+
+# Team temporal smoothing
+team_smoothing_window: 30    # frames for majority vote
+team_consensus_threshold: 0.6  # minimum agreement ratio

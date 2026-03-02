@@ -50,17 +50,47 @@ class Settings(BaseSettings):
     DETECTION_MIN_CONFIDENCE_FLOOR: float = 0.15  # Absolute min confidence for retries
     DETECTION_RETRY_DECAY: float = 0.2        # Confidence decay per retry attempt
     DETECTION_MIN_BOX_AREA: int = 400         # Min bbox area (px) for jersey color extraction
+    DETECTION_IMGSZ: int = 1280               # Native YOLO inference resolution
 
-    # Tracking Tuning
+    # YOLO Model Fallback Chain (tried in order)
+    YOLO_MODEL_CHAIN: list = [
+        "data/models/football_best.pt",  # Fine-tuned football model (Step 3)
+        "yolo11m.pt",                    # YOLO11 medium
+        "yolov8m.pt",                    # YOLOv8 medium (fallback)
+    ]
+    YOLO_MODEL_CHAIN_CPU: list = [
+        "data/models/football_best.pt",  # Fine-tuned football model
+        "yolo11s.pt",                    # YOLO11 small
+        "yolov8s.pt",                    # YOLOv8 small (fallback)
+    ]
+
+    # Tracking Tuning (BoT-SORT / supervision ByteTrack params)
     TRACKING_IOU_THRESHOLD: float = 0.8       # Match threshold (1 - min_iou)
     TRACKING_MAX_INTERPOLATION_FRAMES: int = 3   # Max frames to interpolate lost tracks (keep low for panning cameras)
     TRACKING_INTERPOLATION_CONFIDENCE_DECAY: float = 0.04  # Confidence decay per interpolated frame
+    TRACK_ACTIVATION_THRESHOLD: float = 0.25  # Min confidence for new track
+    TRACK_LOST_BUFFER: int = 60              # Keep lost tracks for 60 frames (~2s at 30fps)
+    TRACK_MINIMUM_MATCHING_THRESHOLD: float = 0.85  # Min IoU for matching
 
     # Team Classification Tuning
     TEAM_COLOR_DISTANCE_THRESHOLD: float = 40.0  # LAB distance for referee/unknown
     TEAM_AMBIGUITY_RATIO: float = 0.85        # min_dist/max_dist ratio above which team is ambiguous
-    TEAM_TEMPORAL_SMOOTHING_WINDOW: int = 5   # Frames for majority-vote team smoothing
+    TEAM_TEMPORAL_SMOOTHING_WINDOW: int = 30  # Frames for majority-vote team smoothing (upgraded)
     TEAM_CONSENSUS_THRESHOLD: float = 0.6     # Min fraction for majority vote
+
+    # SigLIP Team Classification
+    SIGLIP_MODEL_NAME: str = "google/siglip-base-patch16-224"
+    SIGLIP_WARMUP_FRAMES: int = 50           # Frames of crops to collect before fitting
+    SIGLIP_UMAP_COMPONENTS: int = 10         # UMAP dimensionality reduction target
+
+    # SAHI Ball Detection
+    SAHI_SLICE_SIZE: int = 640               # Slice dimensions for SAHI
+    SAHI_OVERLAP_RATIO: float = 0.2          # Overlap between slices
+    BALL_MAX_INTERPOLATION_GAP: int = 20     # Max frames to interpolate missing ball
+
+    # Pitch Keypoint Detection
+    PITCH_KEYPOINT_MODEL_PATH: str = "data/models/pitch_keypoints.pt"
+    PITCH_NUM_KEYPOINTS: int = 32            # Standard pitch keypoints
 
     # Cloud Inference
     CLOUD_INFERENCE_ENABLED: bool = False

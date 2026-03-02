@@ -1,10 +1,11 @@
 """
 Player Detection Service
 
-Uses YOLOv8 for detecting players and classifying teams by jersey color.
-Supports both local CPU inference and cloud GPU inference.
-Enhanced with multi-scale detection and player count validation for
-consistent tracking of all 22 players on the pitch.
+Uses YOLO with model fallback chain for detecting players and classifying
+teams by jersey color. Integrates supervision.Detections as the internal
+detection format for seamless bridge to tracking.
+
+Supports: fine-tuned football model > YOLO11 > YOLOv8 fallback chain.
 """
 import asyncio
 from typing import List, Optional, Tuple, Dict
@@ -17,39 +18,24 @@ from models.schemas import DetectedPlayer, BoundingBox, PixelPosition, TeamSide
 
 
 class DetectionService:
-    """Service for player detection using YOLOv8."""
+    """Service for player detection using YOLO with model fallback chain."""
 
-    # Expected player counts
-    EXPECTED_FIELD_PLAYERS = 22  # 11 per team
-    MIN_EXPECTED_PLAYERS = 18  # Allow for some occlusion
+    EXPECTED_FIELD_PLAYERS = 22
+    MIN_EXPECTED_PLAYERS = 18
 
     def __init__(self):
         self.model = None
+        self.model_name: str = "none"
         self.home_color: Optional[np.ndarray] = None
         self.away_color: Optional[np.ndarray] = None
         self.goalkeeper_colors: List[np.ndarray] = []
         self._cloud_client = None
+        self._sv_available = False
+        self._team_classifier = None  # SigLIP classifier (lazy init in Step 5)
 
-        # Multi-scale detection settings for better coverage
-        # More scales = better detection of distant/small players
-        self.detection_scales = [1.0, 1.5, 0.75, 0.5]  # Process at multiple scales including upscale
-        self.use_multi_scale = True  # Enable for better distant player detection
-
-        # Detection confidence tiers - balanced for accuracy
-        self.high_confidence_thresh = 0.5
-        self.medium_confidence_thresh = 0.35  # Higher to reduce false positives
-        self.low_confidence_thresh = 0.25     # Minimum threshold for distant players
-
-        # NMS settings for merging multi-scale detections
-        self.nms_iou_threshold = 0.5  # Standard threshold for NMS
-
-        # Adaptive detection settings
+        # Detection settings
         self.target_player_count = 22
-        self.min_acceptable_players = 14  # Can be lower for cameras not showing full pitch
-        self.max_detection_retries = 3
-
-        # Maximum players expected per team (to filter obvious outliers)
-        self.max_players_per_team = 14  # 11 + subs/staff visible
+        self.min_acceptable_players = 14
 
     async def initialize(self):
         """Initialize the detection model."""
@@ -58,28 +44,48 @@ class DetectionService:
         else:
             await self._init_local_model()
 
+        # Check if supervision is available
+        try:
+            import supervision as sv
+            self._sv_available = True
+            print("[DETECTION] supervision library available")
+        except ImportError:
+            self._sv_available = False
+
+        # Try to initialize SigLIP team classifier
+        try:
+            from services.team_classifier import TeamClassifier
+            self._team_classifier = TeamClassifier()
+            print("[DETECTION] SigLIP team classifier available (lazy init)")
+        except ImportError:
+            print("[DETECTION] SigLIP team classifier not available, using LAB color fallback")
+
     async def _init_local_model(self):
-        """Initialize local YOLO model."""
+        """Initialize local YOLO model with fallback chain."""
         try:
             from ultralytics import YOLO
 
-            # Use YOLOv8m (medium) for better accuracy, or YOLOv8n (nano) if memory constrained
-            # Model performance ranking: yolov8x > yolov8l > yolov8m > yolov8s > yolov8n
-            if settings.USE_GPU:
-                model_name = "yolov8m.pt"  # Medium model for GPU - good balance
-            else:
-                model_name = "yolov8s.pt"  # Small model for CPU - better than nano for sports
+            # Select model chain based on GPU availability
+            model_chain = settings.YOLO_MODEL_CHAIN if settings.USE_GPU else settings.YOLO_MODEL_CHAIN_CPU
 
-            print(f"[DETECTION] Loading YOLO model: {model_name}")
-            self.model = YOLO(model_name)
-            print(f"[DETECTION] Model loaded successfully")
+            for model_path in model_chain:
+                try:
+                    print(f"[DETECTION] Trying model: {model_path}")
+                    self.model = YOLO(model_path)
+                    self.model_name = model_path
 
-            # Configure for CPU/GPU
-            if not settings.USE_GPU:
-                self.model.to('cpu')
-                print("[DETECTION] Running on CPU")
-            else:
-                print("[DETECTION] Running on GPU")
+                    if not settings.USE_GPU:
+                        self.model.to('cpu')
+                        print(f"[DETECTION] Model loaded: {model_path} (CPU)")
+                    else:
+                        print(f"[DETECTION] Model loaded: {model_path} (GPU)")
+                    break
+                except Exception as e:
+                    print(f"[DETECTION] Failed to load {model_path}: {e}")
+                    continue
+
+            if self.model is None:
+                print("[DETECTION] All models in fallback chain failed. Using mock detection.")
 
         except ImportError as e:
             print(f"Warning: ultralytics not installed ({e}). Using mock detection.")
@@ -114,223 +120,246 @@ class DetectionService:
 
     async def _detect_local(self, frame: np.ndarray) -> List[DetectedPlayer]:
         """
-        Run detection locally using YOLO with multi-scale processing.
+        Run detection locally using YOLO at native 1280 resolution.
 
-        Uses adaptive confidence thresholds and multi-scale detection to
-        ensure all 22 players are detected, even when distant or partially occluded.
+        Simplified from multi-scale approach - modern YOLO handles scale
+        natively at imgsz=1280 which is sufficient for full-pitch footage.
         """
         if self.model is None:
-            # Return mock detection for testing
             return self._mock_detection(frame)
 
         height, width = frame.shape[:2]
+        is_football_model = "football" in self.model_name
 
-        # Adaptive detection: start with standard settings, lower thresholds if needed
-        best_detections = []
+        # Determine classes to detect
+        if is_football_model:
+            # Fine-tuned model has football-specific classes: ball, goalkeeper, player, referee
+            classes = None  # Use all classes from the football model
+        else:
+            # COCO model: only detect persons
+            classes = [settings.PLAYER_CLASS_ID]
 
-        for retry in range(self.max_detection_retries):
-            all_detections = []
+        # Single-pass detection at native resolution
+        results = self.model(
+            frame,
+            conf=settings.DETECTION_CONFIDENCE,
+            classes=classes,
+            verbose=False,
+            imgsz=settings.DETECTION_IMGSZ
+        )
 
-            # Adjust confidence based on retry (lower each time)
-            retry_factor = 1.0 - (retry * settings.DETECTION_RETRY_DECAY)  # e.g. 1.0, 0.8, 0.6
+        # Convert to supervision Detections if available, else manual parse
+        if self._sv_available:
+            detections = self._parse_with_supervision(results, frame, is_football_model)
+        else:
+            detections = self._parse_manual(results, frame, width, height, is_football_model)
 
-            # Multi-scale detection for better coverage of distant players
-            scales_to_use = self.detection_scales if self.use_multi_scale else [1.0]
+        if len(detections) < self.MIN_EXPECTED_PLAYERS:
+            print(f"[DETECTION] Warning: Only detected {len(detections)} players (expected {self.MIN_EXPECTED_PLAYERS}+)")
 
-            for scale in scales_to_use:
-                if scale >= 1.0:
-                    # Original or upscaled - use medium confidence
-                    conf_thresh = self.medium_confidence_thresh * retry_factor
-                elif scale >= 0.75:
-                    # Slightly downscaled - use low confidence
-                    conf_thresh = self.low_confidence_thresh * retry_factor
-                else:
-                    # Heavily downscaled - use very low confidence
-                    conf_thresh = max(settings.DETECTION_MIN_CONFIDENCE_FLOOR, self.low_confidence_thresh * 0.5 * retry_factor)
+        print(f"[DETECTION] {len(detections)} players detected (model: {self.model_name})")
+        return detections
 
-                # Resize frame
-                if scale != 1.0:
-                    new_w = int(width * scale)
-                    new_h = int(height * scale)
-                    scaled_frame = cv2.resize(frame, (new_w, new_h))
-                else:
-                    scaled_frame = frame
+    def _parse_with_supervision(
+        self,
+        results,
+        frame: np.ndarray,
+        is_football_model: bool
+    ) -> List[DetectedPlayer]:
+        """Parse YOLO results via supervision.Detections for consistent format."""
+        import supervision as sv
 
-                # Run YOLO inference
-                results = self.model(
-                    scaled_frame,
-                    conf=conf_thresh,
-                    classes=[settings.PLAYER_CLASS_ID],  # Only detect persons
-                    verbose=False,
-                    imgsz=max(320, min(1280, scaled_frame.shape[1]))  # Adaptive image size
-                )
-
-                for result in results:
-                    boxes = result.boxes
-                    if boxes is None:
-                        continue
-
-                    for box in boxes:
-                        # Scale coordinates back to original frame size
-                        x1, y1, x2, y2 = box.xyxy[0].tolist()
-                        if scale != 1.0:
-                            x1 = int(x1 / scale)
-                            y1 = int(y1 / scale)
-                            x2 = int(x2 / scale)
-                            y2 = int(y2 / scale)
-                        else:
-                            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-
-                        # Clamp to frame bounds
-                        x1 = max(0, min(x1, width - 1))
-                        y1 = max(0, min(y1, height - 1))
-                        x2 = max(0, min(x2, width))
-                        y2 = max(0, min(y2, height))
-
-                        # Filter out unreasonably sized detections
-                        box_width = x2 - x1
-                        box_height = y2 - y1
-
-                        # Players should have reasonable aspect ratio and size
-                        if box_width < 5 or box_height < 10:
-                            continue  # Too small
-                        if box_width > width * 0.3 or box_height > height * 0.5:
-                            continue  # Too large (probably not a player)
-
-                        aspect_ratio = box_height / max(box_width, 1)
-                        if aspect_ratio < settings.DETECTION_ASPECT_RATIO_MIN or aspect_ratio > settings.DETECTION_ASPECT_RATIO_MAX:
-                            continue  # Unreasonable aspect ratio for a human
-
-                        confidence = float(box.conf[0])
-
-                        all_detections.append({
-                            'bbox': [x1, y1, x2, y2],
-                            'confidence': confidence,
-                            'scale': scale
-                        })
-
-            # Apply NMS to merge overlapping detections from different scales
-            merged_detections = self._apply_nms(all_detections)
-
-            # Keep the best result so far
-            if len(merged_detections) > len(best_detections):
-                best_detections = merged_detections
-
-            # If we found enough players, stop retrying
-            if len(merged_detections) >= self.min_acceptable_players:
-                print(f"[DETECTION] Found {len(merged_detections)} players on retry {retry}")
-                break
-
-        # Use the best detection result
-        merged_detections = best_detections
-        print(f"[DETECTION] Final count: {len(merged_detections)} players detected")
-
-        # Convert to DetectedPlayer objects
         players = []
-        for det in merged_detections:
-            x1, y1, x2, y2 = det['bbox']
-            confidence = det['confidence']
+        height, width = frame.shape[:2]
 
-            # Extract jersey color for team classification
-            # Skip color extraction for tiny boxes — too few pixels for reliable color
-            box_area = (x2 - x1) * (y2 - y1)
-            if box_area < settings.DETECTION_MIN_BOX_AREA:
-                jersey_color = None
-            else:
-                player_roi = frame[y1:y2, x1:x2]
-                jersey_color = self._extract_jersey_color(player_roi)
+        for result in results:
+            sv_detections = sv.Detections.from_ultralytics(result)
 
-            # Filter referee/linesman before team classification
-            is_referee = self._is_referee(jersey_color)
+            if len(sv_detections) == 0:
+                continue
 
-            # Classify team (referee gets UNKNOWN)
-            if is_referee:
-                team = TeamSide.UNKNOWN
-            else:
-                team = self._classify_team(jersey_color)
+            for i in range(len(sv_detections)):
+                x1, y1, x2, y2 = sv_detections.xyxy[i].astype(int)
+                confidence = float(sv_detections.confidence[i])
+                class_id = int(sv_detections.class_id[i])
 
-            # Check if goalkeeper
-            is_gk = self._is_goalkeeper(jersey_color, x1, x2, frame.shape[1])
+                # For COCO model, only keep persons
+                if not is_football_model and class_id != settings.PLAYER_CLASS_ID:
+                    continue
 
-            # Calculate center position
-            center_x = (x1 + x2) // 2
-            center_y = (y1 + y2) // 2
+                # For football model, skip ball class (handled by ball_detection)
+                if is_football_model and class_id == 0:  # ball class
+                    continue
 
-            player = DetectedPlayer(
-                track_id=-1,  # Will be assigned by tracker
-                bbox=BoundingBox(
-                    x1=x1, y1=y1, x2=x2, y2=y2,
-                    confidence=confidence
-                ),
-                pixel_position=PixelPosition(x=center_x, y=center_y),
-                team=team,
-                jersey_color=jersey_color.tolist() if jersey_color is not None else None,
-                is_goalkeeper=is_gk
-            )
-            players.append(player)
+                # Clamp to frame bounds
+                x1 = max(0, min(x1, width - 1))
+                y1 = max(0, min(y1, height - 1))
+                x2 = max(0, min(x2, width))
+                y2 = max(0, min(y2, height))
 
-        # Log if we're detecting fewer players than expected
-        if len(players) < self.MIN_EXPECTED_PLAYERS:
-            print(f"[DETECTION] Warning: Only detected {len(players)} players (expected {self.MIN_EXPECTED_PLAYERS}+)")
+                # Filter unreasonable detections
+                if not self._is_valid_player_bbox(x1, y1, x2, y2, width, height):
+                    continue
+
+                # Determine if goalkeeper/referee from football model classes
+                is_gk = False
+                is_referee = False
+                if is_football_model:
+                    is_gk = (class_id == 1)  # goalkeeper class
+                    is_referee = (class_id == 3)  # referee class
+
+                # Extract jersey color for team classification
+                box_area = (x2 - x1) * (y2 - y1)
+                if box_area < settings.DETECTION_MIN_BOX_AREA:
+                    jersey_color = None
+                else:
+                    player_roi = frame[y1:y2, x1:x2]
+                    jersey_color = self._extract_jersey_color(player_roi)
+
+                # Team classification
+                if is_referee:
+                    team = TeamSide.UNKNOWN
+                elif not is_football_model:
+                    # COCO model: check referee by color
+                    if self._is_referee(jersey_color):
+                        team = TeamSide.UNKNOWN
+                        is_referee = True
+                    else:
+                        team = self._classify_team(jersey_color)
+                else:
+                    team = self._classify_team(jersey_color)
+
+                # Goalkeeper detection for COCO model
+                if not is_football_model and not is_gk:
+                    is_gk = self._is_goalkeeper(jersey_color, x1, x2, width)
+
+                center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
+
+                player = DetectedPlayer(
+                    track_id=-1,
+                    bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2, confidence=confidence),
+                    pixel_position=PixelPosition(x=center_x, y=center_y),
+                    team=team,
+                    jersey_color=jersey_color.tolist() if jersey_color is not None else None,
+                    is_goalkeeper=is_gk
+                )
+                players.append(player)
 
         return players
 
-    def _apply_nms(self, detections: List[Dict]) -> List[Dict]:
-        """
-        Apply Non-Maximum Suppression to merge overlapping detections.
+    def _parse_manual(
+        self,
+        results,
+        frame: np.ndarray,
+        width: int,
+        height: int,
+        is_football_model: bool
+    ) -> List[DetectedPlayer]:
+        """Parse YOLO results manually (fallback when supervision not available)."""
+        players = []
 
-        Keeps the detection with highest confidence when boxes overlap.
-        """
-        if not detections:
-            return []
-
-        # Sort by confidence (highest first)
-        detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)
-
-        kept = []
-        suppressed = set()
-
-        for i, det_i in enumerate(detections):
-            if i in suppressed:
+        for result in results:
+            boxes = result.boxes
+            if boxes is None:
                 continue
 
-            kept.append(det_i)
+            for box in boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                confidence = float(box.conf[0])
+                class_id = int(box.cls[0])
 
-            for j, det_j in enumerate(detections[i + 1:], start=i + 1):
-                if j in suppressed:
+                if not is_football_model and class_id != settings.PLAYER_CLASS_ID:
                     continue
 
-                iou = self._calculate_iou(det_i['bbox'], det_j['bbox'])
-                if iou > self.nms_iou_threshold:
-                    suppressed.add(j)
+                if is_football_model and class_id == 0:
+                    continue
 
-        return kept
+                x1 = max(0, min(x1, width - 1))
+                y1 = max(0, min(y1, height - 1))
+                x2 = max(0, min(x2, width))
+                y2 = max(0, min(y2, height))
 
-    def _calculate_iou(self, bbox1: List[int], bbox2: List[int]) -> float:
-        """Calculate Intersection over Union between two bounding boxes."""
-        x1 = max(bbox1[0], bbox2[0])
-        y1 = max(bbox1[1], bbox2[1])
-        x2 = min(bbox1[2], bbox2[2])
-        y2 = min(bbox1[3], bbox2[3])
+                if not self._is_valid_player_bbox(x1, y1, x2, y2, width, height):
+                    continue
 
-        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+                is_gk = is_football_model and (class_id == 1)
+                is_referee = is_football_model and (class_id == 3)
 
-        area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
-        area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+                box_area = (x2 - x1) * (y2 - y1)
+                if box_area < settings.DETECTION_MIN_BOX_AREA:
+                    jersey_color = None
+                else:
+                    player_roi = frame[y1:y2, x1:x2]
+                    jersey_color = self._extract_jersey_color(player_roi)
 
-        union = area1 + area2 - intersection
+                if is_referee:
+                    team = TeamSide.UNKNOWN
+                elif not is_football_model and self._is_referee(jersey_color):
+                    team = TeamSide.UNKNOWN
+                else:
+                    team = self._classify_team(jersey_color)
 
-        return intersection / max(union, 1e-6)
+                if not is_football_model and not is_gk:
+                    is_gk = self._is_goalkeeper(jersey_color, x1, x2, width)
+
+                center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
+
+                player = DetectedPlayer(
+                    track_id=-1,
+                    bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2, confidence=confidence),
+                    pixel_position=PixelPosition(x=center_x, y=center_y),
+                    team=team,
+                    jersey_color=jersey_color.tolist() if jersey_color is not None else None,
+                    is_goalkeeper=is_gk
+                )
+                players.append(player)
+
+        return players
+
+    def _is_valid_player_bbox(
+        self, x1: int, y1: int, x2: int, y2: int, frame_w: int, frame_h: int
+    ) -> bool:
+        """Validate that a bounding box is reasonable for a player."""
+        box_width = x2 - x1
+        box_height = y2 - y1
+
+        if box_width < 5 or box_height < 10:
+            return False
+        if box_width > frame_w * 0.3 or box_height > frame_h * 0.5:
+            return False
+
+        aspect_ratio = box_height / max(box_width, 1)
+        if aspect_ratio < settings.DETECTION_ASPECT_RATIO_MIN or aspect_ratio > settings.DETECTION_ASPECT_RATIO_MAX:
+            return False
+
+        return True
+
+    async def classify_teams_siglip(
+        self, frame: np.ndarray, detections: List[DetectedPlayer]
+    ) -> List[DetectedPlayer]:
+        """
+        Classify teams using SigLIP embeddings if available.
+        Called from the processing pipeline after detection.
+        Falls back to existing LAB color method silently.
+        """
+        if self._team_classifier is None:
+            return detections
+
+        try:
+            return self._team_classifier.classify(frame, detections)
+        except Exception as e:
+            print(f"[DETECTION] SigLIP classification failed, using color fallback: {e}")
+            return detections
 
     async def _detect_cloud(self, frame: np.ndarray) -> List[DetectedPlayer]:
         """Run detection via cloud GPU service."""
         import base64
 
-        # Encode frame
         _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         frame_b64 = base64.b64encode(buffer).decode('utf-8')
 
-        # Send to cloud
         response = await self._cloud_client.post(
             "/detect",
             json={"image": frame_b64}
@@ -339,7 +368,6 @@ class DetectionService:
         if response.status_code != 200:
             return []
 
-        # Parse response
         data = response.json()
         players = []
 
@@ -360,36 +388,31 @@ class DetectionService:
         """Generate mock detections for testing without YOLO."""
         height, width = frame.shape[:2]
 
-        # Generate some mock player positions
         mock_players = []
         positions = [
             (0.2, 0.5), (0.3, 0.3), (0.3, 0.7), (0.4, 0.5),
             (0.5, 0.4), (0.5, 0.6), (0.6, 0.3), (0.6, 0.7),
             (0.7, 0.5), (0.8, 0.4), (0.8, 0.6),
-            (0.15, 0.5),  # Goalkeeper
+            (0.15, 0.5),
         ]
 
         for i, (px, py) in enumerate(positions):
             x = int(px * width)
             y = int(py * height)
 
-            # Mock bounding box (player ~50px wide, ~100px tall)
             x1 = x - 25
             y1 = y - 50
             x2 = x + 25
             y2 = y + 50
 
-            # Alternate teams
             team = TeamSide.HOME if i < 6 else TeamSide.AWAY
             is_gk = i == 11
 
             player = DetectedPlayer(
                 track_id=-1,
                 bbox=BoundingBox(
-                    x1=max(0, x1),
-                    y1=max(0, y1),
-                    x2=min(width, x2),
-                    y2=min(height, y2),
+                    x1=max(0, x1), y1=max(0, y1),
+                    x2=min(width, x2), y2=min(height, y2),
                     confidence=0.85
                 ),
                 pixel_position=PixelPosition(x=x, y=y),
@@ -406,23 +429,18 @@ class DetectionService:
         Extract dominant jersey color from player ROI.
 
         Uses the upper-middle portion of the bounding box (torso area).
-        For small bounding boxes (wide-angle footage), uses entire ROI with grass filtering.
         """
         if player_roi.size == 0:
             return None
 
         h, w = player_roi.shape[:2]
 
-        # For very small bounding boxes (common in wide-angle footage),
-        # use the center of the ROI instead of trying to find torso
         if h < 30 or w < 15:
-            # Use center region for small detections
             torso_y1 = max(0, int(h * 0.25))
             torso_y2 = min(h, int(h * 0.75))
             torso_x1 = max(0, int(w * 0.1))
             torso_x2 = min(w, int(w * 0.9))
         else:
-            # Focus on torso area (upper middle of bounding box) for larger detections
             torso_y1 = int(h * 0.15)
             torso_y2 = int(h * 0.5)
             torso_x1 = int(w * 0.2)
@@ -431,39 +449,31 @@ class DetectionService:
         torso = player_roi[torso_y1:torso_y2, torso_x1:torso_x2]
 
         if torso.size == 0:
-            # Fallback to entire ROI
             torso = player_roi
 
-        # Reshape pixels
         pixels = torso.reshape(-1, 3)
 
-        # Filter out grass-like colors using HSV (lighting-invariant)
-        # Convert pixels to HSV for robust grass detection
+        # Filter out grass-like colors using HSV
         pixels_bgr = pixels.reshape(-1, 1, 3).astype(np.uint8)
         pixels_hsv = cv2.cvtColor(pixels_bgr, cv2.COLOR_BGR2HSV).reshape(-1, 3)
 
         filtered_pixels = []
         for i, pixel in enumerate(pixels):
-            h, s, v = pixels_hsv[i]
+            h_val, s, v = pixels_hsv[i]
             b, g, r = pixel
 
-            # Grass detection via HSV: green hue range 35-85 is lighting-invariant
-            is_grass = (35 <= h <= 85 and s > 30 and v > 30)
-            # Also skip very dark pixels (shadows) and very bright pixels (sky/lines)
+            is_grass = (35 <= h_val <= 85 and s > 30 and v > 30)
             is_dark = (v < 30)
             is_bright = (r > 220 and g > 220 and b > 220)
             if not is_grass and not is_dark and not is_bright:
                 filtered_pixels.append(pixel)
 
-        # If we filtered out too much, use original pixels
         if len(filtered_pixels) < 10:
             filtered_pixels = pixels.tolist()
 
         pixels = np.array(filtered_pixels)
 
-        # Use K-means to find dominant jersey color
         try:
-            # Use 3 clusters to separate jersey from skin and remaining noise
             n_clusters = min(3, len(pixels))
             if n_clusters < 1:
                 return None
@@ -473,7 +483,6 @@ class DetectionService:
 
             labels, counts = np.unique(kmeans.labels_, return_counts=True)
 
-            # Score each cluster: larger clusters win, but penalize skin-like and grass-like colors
             best_score = -1
             best_color = None
 
@@ -481,19 +490,15 @@ class DetectionService:
                 center = kmeans.cluster_centers_[idx]
                 cluster_size = counts[labels == idx][0] if idx in labels else 0
 
-                # Convert cluster center to HSV for penalty checks
                 center_bgr = center.astype(np.uint8).reshape(1, 1, 3)
                 center_hsv = cv2.cvtColor(center_bgr, cv2.COLOR_BGR2HSV).reshape(3)
-                h, s, v = center_hsv
+                h_val, s, v = center_hsv
 
                 score = float(cluster_size)
 
-                # Penalize skin-like colors (HSV hue 0-25, moderate saturation)
-                if h <= 25 and 30 < s < 170 and v > 60:
+                if h_val <= 25 and 30 < s < 170 and v > 60:
                     score *= 0.3
-
-                # Penalize grass-like colors (HSV hue 35-85)
-                if 35 <= h <= 85 and s > 30 and v > 30:
+                if 35 <= h_val <= 85 and s > 30 and v > 30:
                     score *= 0.2
 
                 if score > best_score:
@@ -504,7 +509,6 @@ class DetectionService:
                 return best_color.astype(np.uint8)
             return None
         except Exception:
-            # Fallback to mean color
             return np.mean(pixels, axis=0).astype(np.uint8)
 
     def _bgr_to_lab(self, bgr_color: np.ndarray) -> np.ndarray:
@@ -521,7 +525,6 @@ class DetectionService:
         if self.home_color is None or self.away_color is None:
             return TeamSide.UNKNOWN
 
-        # Convert all colors to LAB for perceptually uniform distance
         color_lab = self._bgr_to_lab(jersey_color)
         home_lab = self._bgr_to_lab(self.home_color)
         away_lab = self._bgr_to_lab(self.away_color)
@@ -532,42 +535,30 @@ class DetectionService:
         min_dist = min(home_dist, away_dist)
         max_dist = max(home_dist, away_dist)
 
-        # Referee threshold: too far from both teams in LAB space
         if min_dist > settings.TEAM_COLOR_DISTANCE_THRESHOLD:
             return TeamSide.UNKNOWN
 
-        # Ambiguity check: colors too similar to both teams
         if max_dist > 0 and min_dist / max_dist > settings.TEAM_AMBIGUITY_RATIO:
             return TeamSide.UNKNOWN
 
         return TeamSide.HOME if home_dist < away_dist else TeamSide.AWAY
 
     def _is_referee(self, jersey_color: Optional[np.ndarray]) -> bool:
-        """
-        Detect referee/linesman by jersey color characteristics.
-
-        Referees typically wear black kits (low V, low S), yellow kits (hue 25-35),
-        or fluorescent green. Also requires color distance > 60 LAB from both team colors.
-        """
+        """Detect referee/linesman by jersey color characteristics."""
         if jersey_color is None:
             return False
 
-        # Convert to HSV for hue-based checks
         bgr_pixel = jersey_color.astype(np.uint8).reshape(1, 1, 3)
         hsv_pixel = cv2.cvtColor(bgr_pixel, cv2.COLOR_BGR2HSV).reshape(3)
         h, s, v = hsv_pixel
 
-        # Black kit: low value, low saturation
         is_black_kit = (v < 60 and s < 80)
-        # Yellow kit: hue 25-35, high saturation
         is_yellow_kit = (25 <= h <= 35 and s > 100 and v > 100)
-        # Fluorescent green: hue 35-75, very high saturation and value
         is_fluoro_green = (35 <= h <= 75 and s > 150 and v > 150)
 
         if not (is_black_kit or is_yellow_kit or is_fluoro_green):
             return False
 
-        # Confirm: must be distant from both team colors in LAB space
         if self.home_color is not None and self.away_color is not None:
             color_lab = self._bgr_to_lab(jersey_color)
             home_lab = self._bgr_to_lab(self.home_color)
@@ -576,30 +567,18 @@ class DetectionService:
             home_dist = np.linalg.norm(color_lab - home_lab)
             away_dist = np.linalg.norm(color_lab - away_lab)
 
-            # Must be distant from both teams
             if home_dist > 60 and away_dist > 60:
                 return True
 
         return False
 
     def _is_goalkeeper(
-        self,
-        jersey_color: Optional[np.ndarray],
-        x1: int,
-        x2: int,
-        frame_width: int
+        self, jersey_color: Optional[np.ndarray], x1: int, x2: int, frame_width: int
     ) -> bool:
-        """
-        Determine if player is a goalkeeper.
-
-        Requires BOTH position evidence AND color distinctness:
-        1. Position near goal (edge of frame)
-        2. Distinct jersey color from own team's field players (distance > 60 LAB)
-        """
+        """Determine if player is a goalkeeper based on position + color distinctness."""
         if jersey_color is None:
             return False
 
-        # Check position (near edges)
         center_x = (x1 + x2) / 2
         near_left = center_x < frame_width * 0.15
         near_right = center_x > frame_width * 0.85
@@ -607,7 +586,6 @@ class DetectionService:
         if not (near_left or near_right):
             return False
 
-        # Check if color is distinct from team colors
         if self.goalkeeper_colors:
             for gk_color in self.goalkeeper_colors:
                 gk_lab = self._bgr_to_lab(gk_color)
@@ -616,8 +594,6 @@ class DetectionService:
                 if dist < 50:
                     return True
 
-        # Must also be color-distinct from own team to confirm GK
-        # A near-edge player wearing the same color as field players is not a GK
         color_distinct = False
         if self.home_color is not None and self.away_color is not None:
             color_lab = self._bgr_to_lab(jersey_color)
@@ -627,7 +603,6 @@ class DetectionService:
             home_dist = np.linalg.norm(color_lab - home_lab)
             away_dist = np.linalg.norm(color_lab - away_lab)
 
-            # GK should be distinct from at least one team (their own)
             color_distinct = home_dist > 60 or away_dist > 60
 
         return color_distinct
@@ -639,15 +614,7 @@ class DetectionService:
         home_gk_color: Optional[List[int]] = None,
         away_gk_color: Optional[List[int]] = None
     ):
-        """
-        Set team jersey colors for classification.
-
-        Args:
-            home_color: RGB color of home team
-            away_color: RGB color of away team
-            home_gk_color: RGB color of home goalkeeper (optional)
-            away_gk_color: RGB color of away goalkeeper (optional)
-        """
+        """Set team jersey colors for classification."""
         self.home_color = np.array(home_color, dtype=np.uint8)
         self.away_color = np.array(away_color, dtype=np.uint8)
 
@@ -658,20 +625,9 @@ class DetectionService:
             self.goalkeeper_colors.append(np.array(away_gk_color, dtype=np.uint8))
 
     async def auto_detect_team_colors(
-        self,
-        detections: List[DetectedPlayer]
+        self, detections: List[DetectedPlayer]
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Automatically detect team colors from player detections.
-
-        Uses K-means clustering on jersey colors to identify two teams.
-
-        Args:
-            detections: List of detected players
-
-        Returns:
-            Tuple of (home_color, away_color) as numpy arrays
-        """
+        """Automatically detect team colors from player detections using K-means."""
         colors = []
         for det in detections:
             if det.jersey_color:
@@ -682,14 +638,11 @@ class DetectionService:
 
         colors = np.array(colors)
 
-        # Cluster into 2-3 groups (2 teams + possibly referee)
         kmeans = KMeans(n_clusters=2, n_init=10, random_state=42)
         kmeans.fit(colors)
 
         team_colors = kmeans.cluster_centers_.astype(np.uint8)
 
-        # Assign based on which side of pitch players are on
-        # (home team typically starts on left)
         self.home_color = team_colors[0]
         self.away_color = team_colors[1]
 
@@ -702,39 +655,24 @@ class DetectionService:
         show_ids: bool = True,
         show_team: bool = True
     ) -> np.ndarray:
-        """
-        Draw detection boxes and labels on frame.
-
-        Args:
-            frame: Original frame
-            detections: List of detected players
-            show_ids: Show track IDs
-            show_team: Show team labels
-
-        Returns:
-            Frame with annotations
-        """
+        """Draw detection boxes and labels on frame."""
         annotated = frame.copy()
 
         for det in detections:
-            # Color based on team
             if det.team == TeamSide.HOME:
-                color = (0, 255, 0)  # Green
+                color = (0, 255, 0)
             elif det.team == TeamSide.AWAY:
-                color = (0, 0, 255)  # Red
+                color = (0, 0, 255)
             else:
-                color = (128, 128, 128)  # Gray
+                color = (128, 128, 128)
 
-            # Draw box
             cv2.rectangle(
                 annotated,
                 (det.bbox.x1, det.bbox.y1),
                 (det.bbox.x2, det.bbox.y2),
-                color,
-                2
+                color, 2
             )
 
-            # Draw label
             label_parts = []
             if show_ids and det.track_id >= 0:
                 label_parts.append(f"#{det.track_id}")
@@ -746,13 +684,9 @@ class DetectionService:
             if label_parts:
                 label = " ".join(label_parts)
                 cv2.putText(
-                    annotated,
-                    label,
+                    annotated, label,
                     (det.bbox.x1, det.bbox.y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    color,
-                    2
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
                 )
 
         return annotated

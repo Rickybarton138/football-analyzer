@@ -7,7 +7,18 @@ from .ball_detection import BallDetectionService
 from .event_detection import EventDetectionService
 from .analytics import AnalyticsEngine
 
-# New analytics services
+# Phase 0: New CV pipeline services
+try:
+    from .team_classifier import TeamClassifier
+except ImportError:
+    pass  # Optional: requires transformers + umap-learn
+
+try:
+    from .pitch_keypoint_detector import PitchKeypointDetector
+except ImportError:
+    pass  # Optional: requires trained pitch_keypoints.pt model
+
+# Analytics services
 from .xg_model import xGModel, xg_model
 from .player_movement import PlayerMovementAnalyzer, player_movement_analyzer
 from .tactical_intelligence import TacticalIntelligenceService, tactical_intelligence
