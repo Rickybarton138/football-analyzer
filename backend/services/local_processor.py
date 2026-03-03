@@ -26,8 +26,14 @@ from config import settings
 # Import professional analytics services (VEO-style)
 from services.match_statistics import match_statistics_service, EventType as StatsEventType
 from services.pitch_visualization import pitch_visualization_service
-from services.event_detector import event_detector
+from services.event_detector import event_detector, DetectedEventType
 from services.coach_assist import coach_assist_service
+
+# Phase 1: Wire existing analytics services
+from services.pass_detector import pass_detector
+from services.xg_model import xg_model, Shot
+from services.formation_detector import formation_detector
+from services.tactical_events import tactical_detector
 
 
 @dataclass
@@ -306,39 +312,58 @@ class LocalVideoProcessor:
         self.use_multi_scale = False  # Disable for faster processing (set True for better detection)
         self.track_counter = 0  # Legacy fallback counter
 
+        # Possession inertia state (prevents flickering)
+        self._possession_track_id: Optional[int] = None
+        self._possession_team: Optional[str] = None
+        self._possession_inertia: int = 0
+
     def _determine_ball_possession(
         self,
         ball_pos: Optional[List[float]],
         player_detections: List[Dict]
-    ) -> Optional[int]:
+    ) -> Tuple[Optional[int], Optional[str]]:
         """
         Determine which player has possession of the ball.
+        Uses 5-frame inertia to prevent flickering between players.
 
-        Returns the track_id of the player closest to the ball, if within
-        possession distance threshold.
+        Returns (track_id, team_str) of the possessing player, or (None, None).
         """
-        if ball_pos is None or not player_detections:
-            return None
+        POSSESSION_DISTANCE = 80  # pixels (~2m real-world)
+        INERTIA_FRAMES = 5  # Must see different player for N frames before switching
 
-        POSSESSION_DISTANCE = 60  # pixels - player must be within this distance
+        if ball_pos is None or not player_detections:
+            return (self._possession_track_id, self._possession_team)
 
         closest_player = None
+        closest_team = None
         min_distance = float('inf')
 
         for det in player_detections:
             bbox = det['bbox']
-            # Calculate player foot position (bottom center of bbox)
             player_x = (bbox[0] + bbox[2]) / 2
             player_y = bbox[3]  # Bottom of bbox (feet)
 
-            # Distance to ball
             dist = np.sqrt((player_x - ball_pos[0])**2 + (player_y - ball_pos[1])**2)
 
             if dist < min_distance and dist < POSSESSION_DISTANCE:
                 min_distance = dist
                 closest_player = det.get('track_id')
+                closest_team = det.get('team')
 
-        return closest_player
+        if closest_player is None:
+            return (self._possession_track_id, self._possession_team)
+
+        # Apply inertia: only switch after INERTIA_FRAMES consecutive frames
+        if closest_player != self._possession_track_id:
+            self._possession_inertia += 1
+            if self._possession_inertia >= INERTIA_FRAMES:
+                self._possession_track_id = closest_player
+                self._possession_team = closest_team
+                self._possession_inertia = 0
+        else:
+            self._possession_inertia = 0
+
+        return (self._possession_track_id, self._possession_team)
 
     def _load_model(self):
         """Load YOLOv8 model for CPU inference."""
@@ -611,6 +636,17 @@ class LocalVideoProcessor:
         self.track_counter = 0  # Reset track counter for new video
         self.tracking_service.reset()  # Reset tracker for new video
 
+        # Reset possession inertia
+        self._possession_track_id = None
+        self._possession_team = None
+        self._possession_inertia = 0
+
+        # Reset Phase 1 analytics services
+        pass_detector.reset()
+        xg_model.reset()
+        formation_detector.reset()
+        tactical_detector.reset()
+
         # Initialize professional analytics services (VEO-style)
         match_statistics_service.reset()
         match_statistics_service.set_video_info(fps=video_fps, total_frames=total_frames)
@@ -802,7 +838,7 @@ class LocalVideoProcessor:
                     ball_pos = yolo_ball_pos  # Fall back to YOLO ball position
 
                 # Determine ball possession and track player moments
-                ball_possessed_by = self._determine_ball_possession(ball_pos, player_detections if model else [])
+                ball_possessed_by, possession_team = self._determine_ball_possession(ball_pos, player_detections if model else [])
 
                 # Feed frame data to player highlights service for clip extraction
                 if detected_players_for_highlights:
@@ -866,22 +902,71 @@ class LocalVideoProcessor:
                     )
 
                     # Feed ball position to event detector for auto-detection of goals, corners, etc.
-                    possessing_team = None
-                    if ball_possessed_by is not None:
-                        for det in player_detections if model else []:
-                            if det.get('track_id') == ball_possessed_by:
-                                possessing_team = det.get('team', None)
-                                if possessing_team:
-                                    possessing_team = "home" if possessing_team == "home" else "away"
-                                break
+                    possessing_team = possession_team
 
-                    event_detector.process_frame(
+                    detected_events = event_detector.process_frame(
                         frame_number=frame_count,
                         timestamp_ms=timestamp_ms,
                         ball_x=ball_pitch_x,
                         ball_y=ball_pitch_y,
                         possessing_team=possessing_team
                     )
+
+                    # Wire xG model: calculate xG for any shot events
+                    if detected_events:
+                        for evt in detected_events:
+                            if evt.event_type in (
+                                DetectedEventType.SHOT,
+                                DetectedEventType.SHOT_ON_TARGET,
+                                DetectedEventType.SHOT_OFF_TARGET,
+                                DetectedEventType.SHOT_BLOCKED,
+                            ):
+                                try:
+                                    shot = Shot(
+                                        x=evt.position_x or ball_pitch_x,
+                                        y=evt.position_y or ball_pitch_y,
+                                        frame_number=frame_count,
+                                        timestamp_ms=timestamp_ms,
+                                        team=evt.team or "unknown",
+                                        player_jersey=evt.player_jersey,
+                                        is_goal=(evt.event_type == DetectedEventType.GOAL),
+                                        on_target=(evt.event_type == DetectedEventType.SHOT_ON_TARGET),
+                                        blocked=(evt.event_type == DetectedEventType.SHOT_BLOCKED),
+                                    )
+                                    xg_result = xg_model.add_shot(shot)
+                                except Exception as e:
+                                    print(f"[xG] Error adding shot: {e}")
+
+                # Build frame_data dict for Phase 1 analytics services
+                frame_data = {
+                    'frame_number': frame_count,
+                    'timestamp': timestamp,
+                    'ball_position': ball_pos,
+                    'detections': player_detections if model else [],
+                }
+
+                # Wire pass detector (every frame — lightweight)
+                try:
+                    pass_detector.process_frame(frame_data)
+                except Exception as e:
+                    if analyzed_count <= 3:
+                        print(f"[PASS] Error: {e}")
+
+                # Wire formation detector (every 5th analyzed frame)
+                if analyzed_count % 5 == 0:
+                    try:
+                        formation_detector.process_frame(frame_data)
+                    except Exception as e:
+                        if analyzed_count <= 5:
+                            print(f"[FORMATION] Error: {e}")
+
+                # Wire tactical event detector (every 2nd analyzed frame)
+                if analyzed_count % 2 == 0:
+                    try:
+                        tactical_detector.process_frame(frame_data)
+                    except Exception as e:
+                        if analyzed_count <= 3:
+                            print(f"[TACTICAL] Error: {e}")
 
                 frame_analysis.player_count = len(frame_analysis.detections)
                 home_player_counts.append(frame_analysis.home_players)
@@ -959,14 +1044,61 @@ class LocalVideoProcessor:
         for event in events[:5]:  # Show first 5
             print(f"  - {event.event_type.value} at {event.timestamp_ms/1000:.1f}s")
 
-        # Initialize coach assist with collected data
+        # Phase 1: Pass detection summary
+        try:
+            pass_stats = pass_detector.get_pass_stats()
+            home_passes = pass_stats.get('home', {})
+            away_passes = pass_stats.get('away', {})
+            print(f"\n=== Pass Detection Summary ===")
+            print(f"Home: {home_passes.get('total', 0)} passes ({home_passes.get('successful', 0)} successful, {home_passes.get('accuracy', 0):.0f}%)")
+            print(f"Away: {away_passes.get('total', 0)} passes ({away_passes.get('successful', 0)} successful, {away_passes.get('accuracy', 0):.0f}%)")
+        except Exception as e:
+            pass_stats = {}
+            print(f"[PASS] Stats error: {e}")
+
+        # Phase 1: Formation detection summary
+        try:
+            formation_stats = formation_detector.calculate_stats()
+            print(f"\n=== Formation Detection Summary ===")
+            for team, stats in formation_stats.items():
+                print(f"{team.capitalize()}: {stats.primary_formation} ({stats.formation_changes} changes)")
+        except Exception as e:
+            formation_stats = {}
+            print(f"[FORMATION] Stats error: {e}")
+
+        # Phase 1: xG summary
+        try:
+            xg_data = xg_model.get_shot_map_data()
+            xg_shots = xg_data.get('shots', [])
+            print(f"\n=== xG Summary ===")
+            print(f"Total shots: {len(xg_shots)}")
+            print(f"Home xG: {xg_data.get('total_xg', {}).get('home', 0):.2f}")
+            print(f"Away xG: {xg_data.get('total_xg', {}).get('away', 0):.2f}")
+        except Exception as e:
+            xg_data = {}
+            print(f"[xG] Stats error: {e}")
+
+        # Phase 1: Tactical events summary
+        try:
+            tactical_summary = tactical_detector.get_events_summary()
+            tactical_total = tactical_summary.get('total_events', 0)
+            event_counts = tactical_summary.get('event_counts', {})
+            print(f"\n=== Tactical Events Summary ===")
+            print(f"Total tactical events: {tactical_total}")
+            for event_type, count in sorted(event_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
+                print(f"  - {event_type}: {count}")
+        except Exception as e:
+            tactical_summary = {}
+            print(f"[TACTICAL] Stats error: {e}")
+
+        # Initialize coach assist with collected data (including formations)
         coach_assist_service.load_match_data(
             match_stats=match_statistics_service,
             pitch_viz=pitch_visualization_service,
             event_detector=event_detector,
             player_highlights=player_highlights_service
         )
-        print(f"Coach Assist AI initialized with match data")
+        print(f"\nCoach Assist AI initialized with match data")
 
         self.current_analysis.end_time = datetime.now().isoformat()
         self.status = "complete"
@@ -980,7 +1112,7 @@ class LocalVideoProcessor:
         return self.current_analysis
 
     def _save_analysis(self, output_path: str):
-        """Save analysis to JSON file."""
+        """Save analysis to JSON file with full analytics data."""
         if self.current_analysis:
             data = {
                 'video_path': self.current_analysis.video_path,
@@ -1006,6 +1138,37 @@ class LocalVideoProcessor:
                     for f in self.current_analysis.frame_analyses
                 ]
             }
+
+            # Enrich with Phase 1 analytics
+            try:
+                data['pass_stats'] = pass_detector.get_pass_stats()
+            except Exception:
+                data['pass_stats'] = {}
+
+            try:
+                formation_stats = formation_detector.calculate_stats()
+                data['formations'] = {
+                    team: {
+                        'primary_formation': s.primary_formation,
+                        'formation_counts': s.formation_counts,
+                        'avg_defensive_line_height': s.avg_defensive_line_height,
+                        'avg_compactness': s.avg_compactness,
+                        'formation_changes': s.formation_changes,
+                    }
+                    for team, s in formation_stats.items()
+                }
+            except Exception:
+                data['formations'] = {}
+
+            try:
+                data['xg'] = xg_model.get_shot_map_data()
+            except Exception:
+                data['xg'] = {}
+
+            try:
+                data['tactical_events'] = tactical_detector.get_events_summary()
+            except Exception:
+                data['tactical_events'] = {}
 
             with open(output_path, 'w') as f:
                 json.dump(data, f, indent=2)
