@@ -1,9 +1,11 @@
 """
-Phase 1 Integration Test
+Phase 1 + Phase 2 Integration Test
 
 Tests that all analytics services are properly wired into the pipeline
 by simulating realistic frame data through the local_processor's analytics chain.
 No video file or YOLO model required.
+
+Phase 2 additions: tactical_intelligence, ai_coach, coach_assist training focus.
 """
 import asyncio
 import numpy as np
@@ -19,6 +21,9 @@ from services.xg_model import xg_model, Shot
 from services.formation_detector import formation_detector
 from services.tactical_events import tactical_detector
 from services.event_detector import event_detector, DetectedEventType
+from services.tactical_intelligence import tactical_intelligence
+from services.ai_coach import ai_coach
+from services.coach_assist import coach_assist_service
 
 
 def test_possession_inertia():
@@ -312,9 +317,177 @@ def test_save_analysis_format():
     print("  PASSED")
 
 
+def test_tactical_intelligence_process_frame():
+    """Test that tactical_intelligence accepts reformatted player data."""
+    print("\n=== Test 8: Tactical Intelligence Process Frame ===")
+    tactical_intelligence.reset()
+
+    # Simulate home and away player lists in tactical_intelligence format
+    home_players = [
+        {'x': 20, 'y': 30, 'jersey_number': 2, 'has_ball': False},
+        {'x': 25, 'y': 50, 'jersey_number': 5, 'has_ball': False},
+        {'x': 22, 'y': 70, 'jersey_number': 3, 'has_ball': False},
+        {'x': 45, 'y': 40, 'jersey_number': 8, 'has_ball': True},
+        {'x': 50, 'y': 60, 'jersey_number': 10, 'has_ball': False},
+    ]
+    away_players = [
+        {'x': 80, 'y': 30, 'jersey_number': 4, 'has_ball': False},
+        {'x': 75, 'y': 50, 'jersey_number': 6, 'has_ball': False},
+        {'x': 78, 'y': 70, 'jersey_number': 3, 'has_ball': False},
+        {'x': 55, 'y': 40, 'jersey_number': 7, 'has_ball': False},
+    ]
+
+    # Process 20 frames
+    for i in range(20):
+        alerts = tactical_intelligence.process_frame(
+            frame_number=i,
+            timestamp_ms=i * 200,
+            home_players=home_players,
+            away_players=away_players,
+            ball_position=(45, 40),
+            possession_team='home',
+        )
+
+    analysis = tactical_intelligence.get_full_analysis()
+    assert 'summary' in analysis, "Missing 'summary' in tactical intelligence"
+    assert 'all_alerts' in analysis, "Missing 'all_alerts' in tactical intelligence"
+    print(f"  Summary keys: {list(analysis['summary'].keys()) if analysis['summary'] else 'empty'}")
+    print(f"  Total alerts: {len(analysis.get('all_alerts', []))}")
+    print("  PASSED")
+
+
+def test_ai_coach_analyze_match():
+    """Test that ai_coach.analyze_match() generates insights from Phase 1 data."""
+    print("\n=== Test 9: AI Coach Analyze Match ===")
+    ai_coach.reset()
+
+    pass_stats = {
+        'home': {'total': 200, 'successful': 140, 'accuracy': 70, 'forward_ratio': 0.3},
+        'away': {'total': 180, 'successful': 110, 'accuracy': 61, 'forward_ratio': 0.2},
+    }
+    formation_stats = {
+        'home': {'primary_formation': '4-4-2', 'formation_changes': 3, 'avg_defensive_line': 35, 'avg_compactness': 28},
+        'away': {'primary_formation': '4-3-3', 'formation_changes': 6, 'avg_defensive_line': 40, 'avg_compactness': 42},
+    }
+    tactical_events = {
+        'total_events': 45,
+        'event_counts': {'high_press': 8, 'counter_attack': 4, 'build_up': 12, 'long_ball': 6},
+    }
+
+    result = ai_coach.analyze_match(
+        pass_stats=pass_stats,
+        formation_stats=formation_stats,
+        tactical_events=tactical_events,
+    )
+
+    assert result is not None, "analyze_match returned None"
+    assert len(ai_coach.insights) > 0, "No insights generated"
+    assert ai_coach.match_summary is not None, "No match summary generated"
+
+    print(f"  Rating: {ai_coach.match_summary.overall_rating}/10")
+    print(f"  Insights: {len(ai_coach.insights)}")
+    print(f"  Strengths: {ai_coach.match_summary.key_strengths[:2]}")
+    print("  PASSED")
+
+
+def test_training_focus_generation():
+    """Test that coach_assist generates training focus with drills."""
+    print("\n=== Test 10: Training Focus Generation ===")
+    coach_assist_service.reset()
+
+    # Load with Phase 1 data that has clear weaknesses
+    coach_assist_service.load_match_data(
+        pass_stats={
+            'home': {'total': 150, 'successful': 85, 'accuracy': 56, 'forward_ratio': 0.12},
+            'away': {'total': 200, 'successful': 170, 'accuracy': 85, 'forward_ratio': 0.4},
+        },
+        formation_stats={
+            'home': {'primary_formation': '4-4-2', 'formation_changes': 9, 'avg_defensive_line': 30, 'avg_compactness': 48},
+            'away': {'primary_formation': '4-3-3', 'formation_changes': 2, 'avg_defensive_line': 45, 'avg_compactness': 25},
+        },
+        xg_data={
+            'total_xg': {'home': 2.1, 'away': 1.8},
+            'shots': [
+                {'team': 'home', 'is_goal': False, 'xg': 0.5},
+                {'team': 'home', 'is_goal': False, 'xg': 0.8},
+                {'team': 'home', 'is_goal': True, 'xg': 0.8},
+                {'team': 'away', 'is_goal': True, 'xg': 0.3},
+                {'team': 'away', 'is_goal': True, 'xg': 0.6},
+            ],
+        },
+        tactical_summary={
+            'total_events': 30,
+            'event_counts': {'high_press': 1, 'counter_attack': 5, 'build_up': 10},
+        },
+    )
+
+    result = coach_assist_service.generate_training_focus()
+
+    assert 'priority_areas' in result, "Missing priority_areas"
+    assert 'session_plan' in result, "Missing session_plan"
+    assert len(result['priority_areas']) > 0, "No priority areas generated"
+
+    print(f"  Priority areas: {len(result['priority_areas'])}")
+    for p in result['priority_areas'][:3]:
+        print(f"    [{p['severity'].upper()}] {p['area']} ({p['team']}) -> {p['drill']}")
+
+    sp = result['session_plan']
+    assert 'warm_up' in sp, "Missing warm_up in session plan"
+    assert 'main_focus' in sp, "Missing main_focus in session plan"
+    assert 'game' in sp, "Missing game in session plan"
+    print(f"  Session plan main focus: {sp['main_focus']['area']}")
+    print("  PASSED")
+
+
+def test_save_analysis_phase2_keys():
+    """Test that _save_analysis includes Phase 2 data keys."""
+    print("\n=== Test 11: Save Analysis Phase 2 Keys ===")
+    import tempfile
+    import json
+
+    proc = LocalVideoProcessor()
+
+    from services.local_processor import MatchAnalysis
+    proc.current_analysis = MatchAnalysis(
+        video_path="test.mp4",
+        duration_seconds=10,
+        total_frames=300,
+        analyzed_frames=50,
+        fps_analyzed=5,
+        start_time="2026-03-03T00:00:00"
+    )
+
+    # Set Phase 2 cached results
+    proc._coaching_analysis = {'rating': 7, 'insights': []}
+    proc._tactical_alerts_summary = {'all_alerts': [], 'summary': {}}
+    proc._training_focus = {'priority_areas': [], 'session_plan': {}}
+
+    # Reset Phase 1 services for clean state
+    pass_detector.reset()
+    xg_model.reset()
+    formation_detector.reset()
+    tactical_detector.reset()
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        tmppath = f.name
+
+    proc._save_analysis(tmppath)
+
+    with open(tmppath, 'r') as f:
+        data = json.load(f)
+
+    phase2_keys = ['coaching_analysis', 'tactical_alerts', 'training_focus']
+    for key in phase2_keys:
+        assert key in data, f"Missing Phase 2 key '{key}' in saved JSON"
+        print(f"  '{key}': present ({type(data[key]).__name__})")
+
+    os.unlink(tmppath)
+    print("  PASSED")
+
+
 if __name__ == '__main__':
     print("=" * 60)
-    print("Phase 1 Integration Tests")
+    print("Phase 1 + Phase 2 Integration Tests")
     print("=" * 60)
 
     tests = [
@@ -325,6 +498,11 @@ if __name__ == '__main__':
         test_tactical_events_wiring,
         test_event_detector_shot_to_xg,
         test_save_analysis_format,
+        # Phase 2 tests
+        test_tactical_intelligence_process_frame,
+        test_ai_coach_analyze_match,
+        test_training_focus_generation,
+        test_save_analysis_phase2_keys,
     ]
 
     passed = 0

@@ -4035,52 +4035,53 @@ async def get_single_player_tracking(track_id: int, frames_ahead: int = 30):
 
 # ============== AI Coaching Expert Endpoints ==============
 
-@app.get("/api/ai-coach/analysis")
-async def get_ai_coaching_analysis():
+
+def _get_cached_or_reanalyze():
     """
-    Get comprehensive AI coaching analysis with tactical insights and recommendations.
-
-    The AI Coach analyzes:
-    - Possession and passing patterns
-    - Formations and team shape
-    - Pressing intensity and effectiveness
-    - Attacking threat and defensive vulnerabilities
-    - Opposition weaknesses to exploit
-
-    Returns actionable coaching recommendations prioritized by importance.
+    Cache-first helper: return cached ai_coach results from pipeline if available,
+    fall back to JSON re-analysis for backwards compatibility.
+    Returns True if ai_coach is ready (has insights), False otherwise.
+    Raises HTTPException(404) if no data at all.
     """
     import json
     import os
 
+    # Fast path: pipeline already ran ai_coach and results are cached in memory
+    if ai_coach.insights:
+        return True
+
+    # Slow path: load from JSON and re-analyze (backwards compat)
     json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+
+    frame_analyses = data.get('frame_analyses', []) or data.get('frames', [])
+    if not frame_analyses:
+        return False
+
+    ps = pass_detector.analyze_from_frames(frame_analyses)
+    fs = formation_detector.analyze_from_frames(frame_analyses)
+    te = tactical_detector.analyze_from_frames(frame_analyses)
+    ai_coach.analyze_match(pass_stats=ps, formation_stats=fs, tactical_events=te, frame_analyses=frame_analyses)
+    return True
+
+
+@app.get("/api/ai-coach/analysis")
+async def get_ai_coaching_analysis():
+    """Get comprehensive AI coaching analysis with tactical insights and recommendations."""
     try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-
-        frame_analyses = data.get('frame_analyses', []) or data.get('frames', []) or data.get('frames', [])
-        if not frame_analyses:
+        if not _get_cached_or_reanalyze():
             return {"error": "No frame data available"}
-
-        # Run all base analyses
-        pass_stats = pass_detector.analyze_from_frames(frame_analyses)
-        formation_stats = formation_detector.analyze_from_frames(frame_analyses)
-        tactical_events = tactical_detector.analyze_from_frames(frame_analyses)
-
-        # Run AI coaching analysis
-        coaching_analysis = ai_coach.analyze_match(
-            pass_stats=pass_stats,
-            formation_stats=formation_stats,
-            tactical_events=tactical_events,
-            frame_analyses=frame_analyses
-        )
 
         return {
             "status": "success",
-            "coaching": coaching_analysis
+            "coaching": ai_coach.get_full_analysis()
         }
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -4092,38 +4093,11 @@ async def get_coaching_insights(
     category: Optional[str] = None,
     priority: Optional[str] = None
 ):
-    """
-    Get filtered coaching insights.
-
-    Args:
-        category: Filter by category (tactical, pressing, possession, defensive,
-                  attacking, set_pieces, player_specific, substitution, formation, physical)
-        priority: Filter by priority (critical, high, medium, low, info)
-    """
-    import json
-    import os
-
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
-    if not os.path.exists(json_path):
-        raise HTTPException(status_code=404, detail="Analysis file not found")
-
+    """Get filtered coaching insights by category and/or priority."""
     try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-
-        frame_analyses = data.get('frame_analyses', []) or data.get('frames', [])
-        if not frame_analyses:
+        if not _get_cached_or_reanalyze():
             return {"error": "No frame data available"}
 
-        # Run analyses
-        pass_stats = pass_detector.analyze_from_frames(frame_analyses)
-        formation_stats = formation_detector.analyze_from_frames(frame_analyses)
-        tactical_events = tactical_detector.analyze_from_frames(frame_analyses)
-
-        # Get AI coaching analysis
-        ai_coach.analyze_match(pass_stats, formation_stats, tactical_events, frame_analyses)
-
-        # Filter insights
         insights = ai_coach.insights
 
         if category:
@@ -4147,41 +4121,18 @@ async def get_coaching_insights(
             "total_insights": len(insights),
             "insights": [i.to_dict() for i in insights]
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/ai-coach/summary")
 async def get_match_summary():
-    """
-    Get the AI Coach's match summary including:
-    - Overall performance rating
-    - Key strengths identified
-    - Areas needing improvement
-    - Half-time and full-time messages for the team
-    """
-    import json
-    import os
-
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
-    if not os.path.exists(json_path):
-        raise HTTPException(status_code=404, detail="Analysis file not found")
-
+    """Get the AI Coach's match summary with rating, strengths, and areas to improve."""
     try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-
-        frame_analyses = data.get('frame_analyses', []) or data.get('frames', [])
-        if not frame_analyses:
+        if not _get_cached_or_reanalyze():
             return {"error": "No frame data available"}
-
-        # Run analyses
-        pass_stats = pass_detector.analyze_from_frames(frame_analyses)
-        formation_stats = formation_detector.analyze_from_frames(frame_analyses)
-        tactical_events = tactical_detector.analyze_from_frames(frame_analyses)
-
-        # Get AI coaching analysis
-        ai_coach.analyze_match(pass_stats, formation_stats, tactical_events, frame_analyses)
 
         if ai_coach.match_summary:
             return {
@@ -4190,38 +4141,18 @@ async def get_match_summary():
             }
         else:
             return {"error": "Summary not available"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/ai-coach/critical")
 async def get_critical_insights():
-    """
-    Get only critical and high-priority coaching insights.
-    These require immediate attention during a match.
-    """
-    import json
-    import os
-
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
-    if not os.path.exists(json_path):
-        raise HTTPException(status_code=404, detail="Analysis file not found")
-
+    """Get only critical and high-priority coaching insights."""
     try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-
-        frame_analyses = data.get('frame_analyses', []) or data.get('frames', [])
-        if not frame_analyses:
+        if not _get_cached_or_reanalyze():
             return {"error": "No frame data available"}
-
-        # Run analyses
-        pass_stats = pass_detector.analyze_from_frames(frame_analyses)
-        formation_stats = formation_detector.analyze_from_frames(frame_analyses)
-        tactical_events = tactical_detector.analyze_from_frames(frame_analyses)
-
-        # Get AI coaching analysis
-        ai_coach.analyze_match(pass_stats, formation_stats, tactical_events, frame_analyses)
 
         critical = ai_coach.get_critical_insights()
 
@@ -4230,40 +4161,18 @@ async def get_critical_insights():
             "critical_count": len(critical),
             "insights": [i.to_dict() for i in critical]
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/ai-coach/team-talk")
 async def get_team_talk(moment: str = "half_time"):
-    """
-    Get an AI-generated team talk for specific moments.
-
-    Args:
-        moment: 'half_time' or 'full_time'
-    """
-    import json
-    import os
-
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
-    if not os.path.exists(json_path):
-        raise HTTPException(status_code=404, detail="Analysis file not found")
-
+    """Get an AI-generated team talk for half-time or full-time."""
     try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-
-        frame_analyses = data.get('frame_analyses', []) or data.get('frames', [])
-        if not frame_analyses:
+        if not _get_cached_or_reanalyze():
             return {"error": "No frame data available"}
-
-        # Run analyses
-        pass_stats = pass_detector.analyze_from_frames(frame_analyses)
-        formation_stats = formation_detector.analyze_from_frames(frame_analyses)
-        tactical_events = tactical_detector.analyze_from_frames(frame_analyses)
-
-        # Get AI coaching analysis
-        ai_coach.analyze_match(pass_stats, formation_stats, tactical_events, frame_analyses)
 
         if not ai_coach.match_summary:
             return {"error": "Summary not available"}
@@ -4275,7 +4184,6 @@ async def get_team_talk(moment: str = "half_time"):
             message = ai_coach.match_summary.full_time_message
             title = "Full-Time Analysis"
 
-        # Get key points to emphasize
         critical = ai_coach.get_critical_insights()
         key_points = [
             {
@@ -4295,72 +4203,94 @@ async def get_team_talk(moment: str = "half_time"):
             "strengths": ai_coach.match_summary.key_strengths,
             "areas_to_improve": ai_coach.match_summary.areas_to_improve
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/ai-coach/chat")
 async def ai_coach_chat(request: dict):
-    """
-    Answer natural language questions about the match analysis.
-
-    The user can ask questions like:
-    - "How was our possession?"
-    - "Who was our best player?"
-    - "What should we work on?"
-    - "How did our pressing look?"
-    - "What formation did we play?"
-
-    Returns AI-generated answers based on the match data.
-    """
-    import json
-    import os
-
+    """Answer natural language questions about the match analysis."""
     question = request.get('question', '')
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
-    if not os.path.exists(json_path):
-        raise HTTPException(status_code=404, detail="Analysis file not found")
-
     try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-
-        frame_analyses = data.get('frame_analyses', []) or data.get('frames', [])
-        if not frame_analyses:
+        if not _get_cached_or_reanalyze():
             return {
                 "status": "error",
                 "answer": "No match data available to analyze. Please process a video first.",
                 "confidence": "low"
             }
 
-        # Run all analyses to get comprehensive match data
-        pass_stats = pass_detector.analyze_from_frames(frame_analyses)
-        formation_stats = formation_detector.analyze_from_frames(frame_analyses)
-        tactical_events = tactical_detector.analyze_from_frames(frame_analyses)
-
-        # Run AI coach analysis
-        ai_coach.analyze_match(pass_stats, formation_stats, tactical_events, frame_analyses)
-
-        # Build match data context for the question answering
         match_data = {
-            'pass_stats': pass_stats,
-            'formation_stats': formation_stats,
-            'tactical_events': tactical_events,
-            'frame_analyses': frame_analyses,
             'insights': [insight.to_dict() for insight in ai_coach.insights] if ai_coach.insights else [],
             'summary': ai_coach.match_summary.to_dict() if ai_coach.match_summary else None
         }
 
-        # Get AI-generated answer
         response = ai_coach.answer_question(question, match_data)
 
         return {
             "status": "success",
             **response
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/ai-coach/training-focus")
+async def get_training_focus():
+    """
+    Get training recommendations based on match weaknesses — THE DIFFERENTIATOR.
+
+    Returns priority areas with specific FA-style drills and a full session plan.
+    Uses cached pipeline results when available, or generates on-demand.
+    """
+    try:
+        from services.local_processor import local_processor
+
+        # Fast path: cached from pipeline
+        cached = local_processor.get_training_focus()
+        if cached and cached.get('priority_areas'):
+            return {"status": "success", **cached}
+
+        # Slow path: generate on-demand from coach_assist_service
+        from services.coach_assist import coach_assist_service
+        result = coach_assist_service.generate_training_focus()
+        if result and result.get('priority_areas'):
+            return {"status": "success", **result}
+
+        return {"status": "success", "priority_areas": [], "session_plan": {}, "message": "No weaknesses detected — well played!"}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/ai-coach/tactical-alerts")
+async def get_tactical_alerts():
+    """
+    Get tactical intelligence alerts from the match analysis.
+
+    Returns summary of tactical patterns, active alerts, and defensive line trends.
+    """
+    try:
+        from services.local_processor import local_processor
+
+        # Fast path: cached from pipeline
+        cached = local_processor.get_tactical_alerts()
+        if cached and (cached.get('all_alerts') or cached.get('summary')):
+            return {"status": "success", **cached}
+
+        # Slow path: try tactical_intelligence directly
+        from services.tactical_intelligence import tactical_intelligence
+        result = tactical_intelligence.get_full_analysis()
+        return {"status": "success", **result}
     except Exception as e:
         import traceback
         traceback.print_exc()

@@ -65,6 +65,12 @@ class CoachAssistService:
         self.talking_points: List[TalkingPoint] = []
         self.questions_history: List[TacticalQuestion] = []
 
+        # Phase 1 analytics data
+        self._pass_stats: Optional[Dict] = None
+        self._formation_stats: Optional[Dict] = None
+        self._xg_data: Optional[Dict] = None
+        self._tactical_summary: Optional[Dict] = None
+
         # AI client (initialized externally)
         self.ai_client = None
         self.ai_provider: str = "none"
@@ -82,7 +88,11 @@ class CoachAssistService:
         formations: Optional[Dict] = None,
         pitch_viz=None,
         event_detector=None,
-        player_highlights=None
+        player_highlights=None,
+        pass_stats: Optional[Dict] = None,
+        formation_stats: Optional[Dict] = None,
+        xg_data: Optional[Dict] = None,
+        tactical_summary: Optional[Dict] = None
     ):
         """
         Load match data for analysis.
@@ -136,6 +146,12 @@ class CoachAssistService:
 
         # Store player highlights for clip suggestions
         self._player_highlights = player_highlights
+
+        # Store Phase 1 analytics data
+        self._pass_stats = pass_stats
+        self._formation_stats = formation_stats
+        self._xg_data = xg_data
+        self._tactical_summary = tactical_summary
 
     def generate_match_summary(self) -> str:
         """
@@ -451,7 +467,9 @@ class CoachAssistService:
         context = self._build_ai_context()
 
         # Create prompt for AI
-        prompt = f"""You are an expert football coach assistant analyzing a match.
+        prompt = f"""You are an expert FA-qualified football coach. Your job is NOT just to describe
+what happened, but to tell the coach WHAT TO DO about it. Every answer should
+include: (1) what the data shows, (2) why it matters, (3) what to work on in training.
 
 Match Data:
 {json.dumps(context, indent=2)}
@@ -459,7 +477,7 @@ Match Data:
 Coach's Question: {question}
 
 Provide a concise, actionable answer based on the match data. Include specific statistics when relevant.
-Focus on practical coaching insights that can be used in team discussions or training.
+Focus on practical coaching insights — drills, exercises, and tactical adjustments.
 Keep the answer under 200 words."""
 
         try:
@@ -555,11 +573,11 @@ Keep the answer under 200 words."""
         )
 
     def _build_ai_context(self) -> Dict:
-        """Build context dict for AI prompts."""
+        """Build context dict for AI prompts, enriched with Phase 1 analytics."""
         if not self.match_data:
             return {}
 
-        return {
+        context = {
             "match_stats": self.match_data["stats"],
             "key_events": self.events_data[:20] if self.events_data else [],
             "talking_points": [
@@ -567,6 +585,54 @@ Keep the answer under 200 words."""
                 for tp in self.talking_points[:5]
             ]
         }
+
+        # Enrich with Phase 1 pass analysis
+        if self._pass_stats:
+            home_p = self._pass_stats.get('home', {})
+            away_p = self._pass_stats.get('away', {})
+            context["pass_analysis"] = {
+                "home_total": home_p.get('total', 0),
+                "home_accuracy": home_p.get('accuracy', 0),
+                "home_forward_ratio": home_p.get('forward_ratio', 0),
+                "away_total": away_p.get('total', 0),
+                "away_accuracy": away_p.get('accuracy', 0),
+                "away_forward_ratio": away_p.get('forward_ratio', 0),
+            }
+
+        # Enrich with formation data
+        if self._formation_stats:
+            formations = {}
+            for team in ['home', 'away']:
+                team_f = self._formation_stats.get(team, {})
+                if team_f:
+                    formations[team] = {
+                        "primary_formation": team_f.get('primary_formation', 'unknown'),
+                        "formation_changes": team_f.get('formation_changes', 0),
+                        "avg_defensive_line": team_f.get('avg_defensive_line', 0),
+                        "avg_compactness": team_f.get('avg_compactness', 0),
+                    }
+            if formations:
+                context["formations"] = formations
+
+        # Enrich with xG data
+        if self._xg_data:
+            total_xg = self._xg_data.get('total_xg', {})
+            context["expected_goals"] = {
+                "home_xg": total_xg.get('home', 0),
+                "away_xg": total_xg.get('away', 0),
+                "total_shots": len(self._xg_data.get('shots', [])),
+            }
+
+        # Enrich with tactical events
+        if self._tactical_summary:
+            event_counts = self._tactical_summary.get('event_counts', {})
+            top_events = sorted(event_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+            context["tactical_events"] = {
+                "total_events": self._tactical_summary.get('total_events', 0),
+                "top_event_types": {k: v for k, v in top_events},
+            }
+
+        return context
 
     def get_suggested_clips(self, category: Optional[InsightCategory] = None) -> List[Dict]:
         """
@@ -621,6 +687,190 @@ Keep the answer under 200 words."""
             ]
         }
 
+    def generate_training_focus(self) -> Dict:
+        """
+        THE DIFFERENTIATOR: Convert match weaknesses into training recommendations.
+
+        Analyzes Phase 1 data to identify priority areas and prescribe
+        specific FA-style training drills and session plans.
+        """
+        priority_areas = []
+
+        # --- Analyze pass stats ---
+        if self._pass_stats:
+            for team in ['home', 'away']:
+                tp = self._pass_stats.get(team, {})
+                accuracy = tp.get('accuracy', 100)
+                forward_ratio = tp.get('forward_ratio', 0.5)
+
+                if accuracy < 70:
+                    priority_areas.append({
+                        "area": "Pass Accuracy",
+                        "team": team,
+                        "severity": "high" if accuracy < 60 else "medium",
+                        "metric": f"{accuracy:.0f}%",
+                        "drill": "Rondo 4v2 / Directional possession",
+                        "detail": "Focus on weight and timing of pass. Progress from 5v2 to 4v2 to increase pressure. Add directional element to simulate match build-up.",
+                        "duration_mins": 15,
+                    })
+
+                if forward_ratio < 0.25:
+                    priority_areas.append({
+                        "area": "Progressive Passing",
+                        "team": team,
+                        "severity": "high" if forward_ratio < 0.15 else "medium",
+                        "metric": f"{forward_ratio*100:.0f}% forward passes",
+                        "drill": "Progressive passing gates exercise",
+                        "detail": "Set up gates at 10m intervals. Players must pass through at least 2 gates before finishing. Reward forward passing with points.",
+                        "duration_mins": 15,
+                    })
+
+        # --- Analyze formation stats ---
+        if self._formation_stats:
+            for team in ['home', 'away']:
+                tf = self._formation_stats.get(team, {})
+                changes = tf.get('formation_changes', 0)
+                compactness = tf.get('avg_compactness', 0)
+
+                if changes > 5:
+                    priority_areas.append({
+                        "area": "Formation Stability",
+                        "team": team,
+                        "severity": "high" if changes > 8 else "medium",
+                        "metric": f"{changes} formation changes",
+                        "drill": "Shadow play 11v0, freeze & check",
+                        "detail": "Walk through shape in 11v0. Coach calls freeze — players check distances. Progress to shadow play vs 11 mannequins, then opposed.",
+                        "duration_mins": 20,
+                    })
+
+                if compactness > 35:
+                    priority_areas.append({
+                        "area": "Team Compactness",
+                        "team": team,
+                        "severity": "high" if compactness > 45 else "medium",
+                        "metric": f"avg {compactness:.0f}m between players",
+                        "drill": "Small-sided games on reduced pitch",
+                        "detail": "Play 7v7 on 40x30 yard pitch. Enforce maximum 2-touch. Team loses possession if any player is more than 15 yards from nearest teammate.",
+                        "duration_mins": 20,
+                    })
+
+        # --- Analyze tactical events ---
+        if self._tactical_summary:
+            event_counts = self._tactical_summary.get('event_counts', {})
+
+            pressing_events = event_counts.get('high_press', 0) + event_counts.get('pressing_trigger', 0)
+            if pressing_events < 5:
+                priority_areas.append({
+                    "area": "Pressing Intensity",
+                    "team": "home",
+                    "severity": "medium",
+                    "metric": f"{pressing_events} pressing actions",
+                    "drill": "4v4+4 pressing rehearsal with triggers",
+                    "detail": "4 attackers vs 4 defenders with 4 neutral players. Pressing team activates on trigger (bad touch, backward pass). 6-second rule to win ball back.",
+                    "duration_mins": 15,
+                })
+
+            counter_attacks = event_counts.get('counter_attack', 0) + event_counts.get('counter_attack_conceded', 0)
+            if counter_attacks > 3:
+                priority_areas.append({
+                    "area": "Counter-Press / Transition Defence",
+                    "team": "home",
+                    "severity": "high" if counter_attacks > 6 else "medium",
+                    "metric": f"{counter_attacks} counter-attacks conceded",
+                    "drill": "Transition game with counter-press",
+                    "detail": "5v5+GKs — on turnover, losing team has 5 seconds to win ball back (counter-press). If they fail, opposition scores double points for transition goal.",
+                    "duration_mins": 15,
+                })
+
+        # --- Analyze xG data ---
+        if self._xg_data:
+            total_xg = self._xg_data.get('total_xg', {})
+            shots = self._xg_data.get('shots', [])
+
+            for team in ['home', 'away']:
+                team_xg = total_xg.get(team, 0)
+                team_shots = [s for s in shots if s.get('team') == team]
+                team_goals = sum(1 for s in team_shots if s.get('is_goal', False))
+
+                if team_xg > 0 and team_goals < team_xg - 0.5:
+                    priority_areas.append({
+                        "area": "Finishing / Clinical Conversion",
+                        "team": team,
+                        "severity": "high",
+                        "metric": f"{team_goals} goals from {team_xg:.2f} xG",
+                        "drill": "Finishing circuit (3 stations)",
+                        "detail": "Station 1: 1v1 vs GK from edge of box. Station 2: Cutback finish from byline cross. Station 3: Quick combination then strike. 2 mins per station, rotate.",
+                        "duration_mins": 15,
+                    })
+
+            # High xG against — defensive block needed
+            for team in ['home', 'away']:
+                opp_team = 'away' if team == 'home' else 'home'
+                opp_xg = total_xg.get(opp_team, 0)
+                if opp_xg > 1.5:
+                    priority_areas.append({
+                        "area": "Defensive Block / Shot Prevention",
+                        "team": team,
+                        "severity": "high" if opp_xg > 2.0 else "medium",
+                        "metric": f"{opp_xg:.2f} xG conceded",
+                        "drill": "Defensive block work",
+                        "detail": "11v11 on half pitch. Defending team sets block (2 banks of 4 + 2 strikers). Attacking team must score within 8 passes. Focus on compactness, no gaps between lines.",
+                        "duration_mins": 20,
+                    })
+
+        # Sort by severity (high first)
+        severity_order = {'high': 0, 'medium': 1, 'low': 2}
+        priority_areas.sort(key=lambda x: severity_order.get(x.get('severity', 'low'), 2))
+
+        # Build session plan from top priorities
+        session_plan = self._build_session_plan(priority_areas)
+
+        return {
+            "priority_areas": priority_areas,
+            "session_plan": session_plan,
+            "generated_at": datetime.now().isoformat(),
+        }
+
+    def _build_session_plan(self, priority_areas: List[Dict]) -> Dict:
+        """Build a structured training session plan from priority areas."""
+        # Pick top priorities for main and secondary focus
+        high_priorities = [p for p in priority_areas if p.get('severity') == 'high']
+        medium_priorities = [p for p in priority_areas if p.get('severity') == 'medium']
+
+        main_focus = high_priorities[0] if high_priorities else (medium_priorities[0] if medium_priorities else None)
+        secondary_focus = high_priorities[1] if len(high_priorities) > 1 else (
+            medium_priorities[0] if medium_priorities and main_focus not in medium_priorities else
+            (medium_priorities[1] if len(medium_priorities) > 1 else None)
+        )
+
+        return {
+            "warm_up": {
+                "activity": "Dynamic warm-up with ball (passing pairs → movement patterns)",
+                "duration_mins": 10,
+            },
+            "main_focus": {
+                "area": main_focus['area'] if main_focus else "General play",
+                "drill": main_focus['drill'] if main_focus else "Possession game",
+                "detail": main_focus['detail'] if main_focus else "Keep ball in 6v4. Focus on quality.",
+                "duration_mins": main_focus.get('duration_mins', 20) if main_focus else 20,
+            },
+            "secondary_focus": {
+                "area": secondary_focus['area'] if secondary_focus else "Team shape",
+                "drill": secondary_focus['drill'] if secondary_focus else "Shadow play",
+                "detail": secondary_focus['detail'] if secondary_focus else "Walk through team shape.",
+                "duration_mins": secondary_focus.get('duration_mins', 15) if secondary_focus else 15,
+            },
+            "game": {
+                "activity": "Conditioned match — apply session focus in game context",
+                "conditions": f"Bonus point for demonstrating {main_focus['area'].lower()}" if main_focus else "Free play",
+                "duration_mins": 20,
+            },
+            "cool_down": {
+                "activity": "Light jog, static stretches, group review of session focus",
+                "duration_mins": 10,
+            },
+        }
+
     def reset(self):
         """Reset the service."""
         self.match_data = None
@@ -629,6 +879,10 @@ Keep the answer under 200 words."""
         self.questions_history = []
         self._pitch_viz = None
         self._player_highlights = None
+        self._pass_stats = None
+        self._formation_stats = None
+        self._xg_data = None
+        self._tactical_summary = None
 
 
 # Global instance

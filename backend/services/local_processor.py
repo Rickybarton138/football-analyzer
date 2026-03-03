@@ -35,6 +35,10 @@ from services.xg_model import xg_model, Shot
 from services.formation_detector import formation_detector
 from services.tactical_events import tactical_detector
 
+# Phase 2: AI Coaching Intelligence
+from services.tactical_intelligence import tactical_intelligence
+from services.ai_coach import ai_coach
+
 
 @dataclass
 class Detection:
@@ -316,6 +320,11 @@ class LocalVideoProcessor:
         self._possession_track_id: Optional[int] = None
         self._possession_team: Optional[str] = None
         self._possession_inertia: int = 0
+
+        # Phase 2: Cached coaching intelligence results
+        self._coaching_analysis: Optional[Dict] = None
+        self._tactical_alerts_summary: Optional[Dict] = None
+        self._training_focus: Optional[Dict] = None
 
     def _determine_ball_possession(
         self,
@@ -659,6 +668,13 @@ class LocalVideoProcessor:
 
         coach_assist_service.reset()
 
+        # Reset Phase 2 coaching intelligence services
+        tactical_intelligence.reset()
+        ai_coach.reset()
+        self._coaching_analysis = None
+        self._tactical_alerts_summary = None
+        self._training_focus = None
+
         # Initialize jersey detection services
         # AI jersey detection (GPT-4V/Claude Vision) is preferred over traditional OCR
         jersey_ocr_service.reset()
@@ -968,6 +984,49 @@ class LocalVideoProcessor:
                         if analyzed_count <= 3:
                             print(f"[TACTICAL] Error: {e}")
 
+                # Phase 2: Wire tactical intelligence (every 5th frame)
+                if analyzed_count % 5 == 0:
+                    try:
+                        # Transform player_detections into tactical_intelligence format
+                        # Expects separate home/away lists with {x, y, jersey_number, has_ball}
+                        ti_home = []
+                        ti_away = []
+                        for det in (player_detections if model else []):
+                            bbox = det.get('bbox', [0, 0, 0, 0])
+                            cx = (bbox[0] + bbox[2]) / 2
+                            cy = (bbox[1] + bbox[3]) / 2
+                            # Normalize to 0-100 pitch coordinates
+                            px = (cx / frame_width) * 100 if frame_width > 0 else 0
+                            py = (cy / frame_height) * 100 if frame_height > 0 else 0
+                            tid = det.get('track_id')
+                            has_ball = (ball_possessed_by is not None and tid == ball_possessed_by)
+                            jersey = ai_jersey_detection_service.get_best_jersey_number(tid) if tid else None
+                            player_entry = {
+                                'x': px, 'y': py,
+                                'jersey_number': jersey or 0,
+                                'has_ball': has_ball,
+                            }
+                            if det.get('team') == 'home':
+                                ti_home.append(player_entry)
+                            elif det.get('team') == 'away':
+                                ti_away.append(player_entry)
+
+                        bp = None
+                        if ball_pos:
+                            bp = ((ball_pos[0] / frame_width) * 100, (ball_pos[1] / frame_height) * 100)
+
+                        tactical_intelligence.process_frame(
+                            frame_number=frame_count,
+                            timestamp_ms=int(timestamp * 1000),
+                            home_players=ti_home,
+                            away_players=ti_away,
+                            ball_position=bp,
+                            possession_team=possession_team,
+                        )
+                    except Exception as e:
+                        if analyzed_count <= 5:
+                            print(f"[TACTICAL_INTEL] Error: {e}")
+
                 frame_analysis.player_count = len(frame_analysis.detections)
                 home_player_counts.append(frame_analysis.home_players)
                 away_player_counts.append(frame_analysis.away_players)
@@ -1091,14 +1150,71 @@ class LocalVideoProcessor:
             tactical_summary = {}
             print(f"[TACTICAL] Stats error: {e}")
 
-        # Initialize coach assist with collected data (including formations)
+        # Convert formation_stats dataclasses to dicts for downstream consumers
+        formation_stats_dicts = {}
+        try:
+            for team, stats in formation_stats.items():
+                formation_stats_dicts[team] = {
+                    'primary_formation': stats.primary_formation,
+                    'formation_counts': stats.formation_counts,
+                    'avg_defensive_line': stats.avg_defensive_line_height,
+                    'avg_compactness': stats.avg_compactness,
+                    'formation_changes': stats.formation_changes,
+                }
+        except Exception:
+            formation_stats_dicts = {}
+
+        # Initialize coach assist with collected data + Phase 1 analytics
         coach_assist_service.load_match_data(
             match_stats=match_statistics_service,
             pitch_viz=pitch_visualization_service,
             event_detector=event_detector,
-            player_highlights=player_highlights_service
+            player_highlights=player_highlights_service,
+            pass_stats=pass_stats,
+            formation_stats=formation_stats_dicts,
+            xg_data=xg_data,
+            tactical_summary=tactical_summary,
         )
-        print(f"\nCoach Assist AI initialized with match data")
+        print(f"\nCoach Assist AI initialized with match data + Phase 1 analytics")
+
+        # Phase 2: Run AI Coach analysis
+        try:
+            self._coaching_analysis = ai_coach.analyze_match(
+                pass_stats=pass_stats,
+                formation_stats=formation_stats_dicts,
+                tactical_events=tactical_summary,
+                frame_analyses=None,
+            )
+            summary = ai_coach.match_summary
+            if summary:
+                print(f"\n=== AI Coach Analysis ===")
+                print(f"Overall rating: {summary.overall_rating}/10")
+                print(f"Strengths: {', '.join(summary.key_strengths[:3])}")
+                print(f"Insights generated: {len(ai_coach.insights)}")
+        except Exception as e:
+            self._coaching_analysis = {}
+            print(f"[AI_COACH] Analysis error: {e}")
+
+        # Phase 2: Collect tactical intelligence summary
+        try:
+            self._tactical_alerts_summary = tactical_intelligence.get_full_analysis()
+            alert_count = len(self._tactical_alerts_summary.get('all_alerts', []))
+            print(f"\n=== Tactical Intelligence ===")
+            print(f"Total tactical alerts: {alert_count}")
+        except Exception as e:
+            self._tactical_alerts_summary = {}
+            print(f"[TACTICAL_INTEL] Summary error: {e}")
+
+        # Phase 2: Generate training focus — THE DIFFERENTIATOR
+        try:
+            self._training_focus = coach_assist_service.generate_training_focus()
+            priorities = self._training_focus.get('priority_areas', [])
+            print(f"\n=== Training Focus ===")
+            for p in priorities[:3]:
+                print(f"  [{p.get('severity', '').upper()}] {p.get('area')} ({p.get('team')}) — {p.get('drill')}")
+        except Exception as e:
+            self._training_focus = {}
+            print(f"[TRAINING] Focus error: {e}")
 
         self.current_analysis.end_time = datetime.now().isoformat()
         self.status = "complete"
@@ -1170,6 +1286,11 @@ class LocalVideoProcessor:
             except Exception:
                 data['tactical_events'] = {}
 
+            # Enrich with Phase 2 coaching intelligence
+            data['coaching_analysis'] = self._coaching_analysis or {}
+            data['tactical_alerts'] = self._tactical_alerts_summary or {}
+            data['training_focus'] = self._training_focus or {}
+
             with open(output_path, 'w') as f:
                 json.dump(data, f, indent=2)
 
@@ -1184,6 +1305,18 @@ class LocalVideoProcessor:
             'status': self.status,
             'analyzed_frames': self.current_analysis.analyzed_frames if self.current_analysis else 0
         }
+
+    def get_coaching_analysis(self) -> Dict:
+        """Get cached AI Coach analysis from pipeline run."""
+        return self._coaching_analysis or {}
+
+    def get_tactical_alerts(self) -> Dict:
+        """Get cached tactical intelligence alerts from pipeline run."""
+        return self._tactical_alerts_summary or {}
+
+    def get_training_focus(self) -> Dict:
+        """Get cached training focus / session plan from pipeline run."""
+        return self._training_focus or {}
 
 
 # Global instance
