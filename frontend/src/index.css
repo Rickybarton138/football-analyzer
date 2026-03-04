@@ -6,8 +6,8 @@
   font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  color: #213547;
-  background-color: #f8fafc;
+  color: #e2e8f0;
+  background-color: #0f172a;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -22,22 +22,22 @@ body {
 
 /* Custom scrollbar */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #f1f5f9;
+  background: #1e293b;
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
+  background: #475569;
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
+  background: #64748b;
 }
 
 /* Football pitch styling */
@@ -67,4 +67,20 @@ body {
 
 .player-marker:hover {
   transform: scale(1.2);
+}
+
+/* Print styles for training page */
+@media print {
+  body {
+    background: white !important;
+    color: black !important;
+  }
+
+  .print\\:break-before-page {
+    break-before: page;
+  }
+
+  aside, nav, button, .fixed {
+    display: none !important;
+  }
 }

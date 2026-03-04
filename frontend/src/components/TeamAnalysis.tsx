@@ -61,7 +61,7 @@ export function TeamAnalysis() {
   const [activeTab, setActiveTab] = useState<'my-team' | 'opponent'>('my-team');
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string>('Ready');
-  const [teamsLoading, setTeamsLoading] = useState(true);
+  const [, setTeamsLoading] = useState(true);
 
   // Fetch available teams
   useEffect(() => {

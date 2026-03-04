@@ -1,15 +1,10 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 import {
-  Play,
-  Pause,
-  SkipBack,
-  SkipForward,
   Save,
   Trash2,
   Users,
   CircleDot,
   Download,
-  Upload,
   RefreshCw,
   ChevronLeft,
   ChevronRight,

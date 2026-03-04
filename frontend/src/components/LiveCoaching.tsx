@@ -1,11 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Play, Pause, Radio, Volume2, VolumeX, Settings,
-  AlertTriangle, Zap, Lightbulb, X, Clock, Target,
-  TrendingUp, Users, Activity, RefreshCw
+  AlertTriangle, Zap, Lightbulb, X,
+  Activity, RefreshCw
 } from 'lucide-react';
 import clsx from 'clsx';
-import type { TacticalAlert, AlertPriority, DetectedPlayer, Position } from '../types';
+import type { AlertPriority, DetectedPlayer, Position } from '../types';
 
 // Types for live coaching
 interface LiveStats {
@@ -103,13 +103,6 @@ interface FullTeamStats {
 interface LiveCoachingProps {
   onClose?: () => void;
 }
-
-// Audio alert sounds
-const ALERT_SOUNDS = {
-  immediate: '/sounds/alert-urgent.mp3',
-  tactical: '/sounds/alert-tactical.mp3',
-  strategic: '/sounds/alert-info.mp3',
-};
 
 export function LiveCoaching({ onClose }: LiveCoachingProps) {
   // State
@@ -392,13 +385,6 @@ export function LiveCoaching({ onClose }: LiveCoachingProps) {
       }
     };
   }, []);
-
-  // Format time
-  const formatTime = (ms: number): string => {
-    const minutes = Math.floor(ms / 60000);
-    const seconds = Math.floor((ms % 60000) / 1000);
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-  };
 
   return (
     <div className="h-full flex flex-col bg-[#0a0f1a]">

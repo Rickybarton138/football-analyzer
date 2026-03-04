@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 
 interface TacticalAlert {
   type: string;
@@ -46,7 +46,7 @@ export function TacticalAlerts({
     onDismiss?.(frame);
   };
 
-  const getPriorityStyles = (priority: number, priorityName: string) => {
+  const getPriorityStyles = (_priority: number, priorityName: string) => {
     switch (priorityName) {
       case 'CRITICAL':
         return {
@@ -230,11 +230,10 @@ export function TacticalAlerts({
 // Compact version for side panel
 export function TacticalAlertsFeed({
   alerts,
-  currentFrame,
   maxVisible = 10
 }: {
   alerts: TacticalAlert[];
-  currentFrame: number;
+  currentFrame?: number;
   maxVisible?: number;
 }) {
   const recentAlerts = alerts
@@ -251,7 +250,7 @@ export function TacticalAlertsFeed({
 
   return (
     <div className="space-y-1">
-      {recentAlerts.map((alert, idx) => (
+      {recentAlerts.map((alert) => (
         <div
           key={alert.frame}
           className={`

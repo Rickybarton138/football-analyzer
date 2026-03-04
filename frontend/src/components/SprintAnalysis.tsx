@@ -1,5 +1,3 @@
-import React, { useMemo } from 'react';
-
 interface Sprint {
   player_id: number;
   team: 'home' | 'away';

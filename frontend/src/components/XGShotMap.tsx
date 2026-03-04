@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import { useMemo } from 'react';
 
 interface Shot {
   x: number;        // 0-100 pitch coordinates
