@@ -88,6 +88,13 @@ class Settings(BaseSettings):
     SAHI_OVERLAP_RATIO: float = 0.2          # Overlap between slices
     BALL_MAX_INTERPOLATION_GAP: int = 20     # Max frames to interpolate missing ball
 
+    # SAHI Player Detection
+    SAHI_PLAYER_DETECTION: bool = True        # Enable SAHI for player detection
+    SAHI_PLAYER_MIN_TRIGGER: int = 18         # Only run SAHI if standard YOLO finds fewer than this
+    SAHI_PLAYER_SLICE_SIZE: int = 640         # Tile size (can differ from ball detection)
+    SAHI_PLAYER_OVERLAP: float = 0.2          # Tile overlap ratio
+    SAHI_PLAYER_CONFIDENCE: float = 0.25      # Lower confidence for small players
+
     # Pitch Keypoint Detection
     PITCH_KEYPOINT_MODEL_PATH: str = "data/models/pitch_keypoints.pt"
     PITCH_NUM_KEYPOINTS: int = 32            # Standard pitch keypoints
@@ -106,6 +113,13 @@ class Settings(BaseSettings):
     # Pitch Dimensions (standard football pitch in meters)
     PITCH_LENGTH: float = 105.0
     PITCH_WIDTH: float = 68.0
+
+    # Clip Analysis Settings
+    CLIP_ANALYSIS_FPS: int = 10           # FPS for per-clip detection (lower = faster)
+    CLIP_FIRST_TOUCH_THRESHOLD: float = 0.8  # Seconds — elite first touch < 0.5s
+    CLIP_PROGRESSIVE_CARRY_DISTANCE: float = 10.0  # Meters forward to count as progressive carry
+    CLIP_PRESSING_INTENSITY_WINDOW: float = 3.0     # Seconds to measure pressing distance closed
+    CLIP_DECISION_SPEED_ELITE: float = 0.5           # Elite decision speed in seconds
 
     # Analytics
     SPRINT_THRESHOLD_KMH: float = 25.0  # Speed threshold for sprint detection
@@ -127,6 +141,22 @@ class Settings(BaseSettings):
 
     # Anthropic (Claude Vision)
     ANTHROPIC_API_KEY: Optional[str] = None
+
+    # AI Coaching Engine
+    AI_COACHING_PROVIDER: str = "claude"
+    AI_COACHING_MODEL: str = "claude-sonnet-4-20250514"
+    AI_COACHING_MAX_TOKENS: int = 2000
+    AI_VISION_PROVIDER: str = "openai"
+    AI_VISION_MODEL: str = "gpt-4o"
+    AI_VISION_MAX_TOKENS: int = 1500
+
+    # Off-Screen Player Prediction
+    PREDICTION_VELOCITY_DECAY_RATE: float = 0.02       # Velocity halves at ~25 frames, zero at ~50
+    PREDICTION_FORMATION_BLEND_FRAMES: int = 90         # Frames to fully blend to formation template (~3s)
+    PREDICTION_CONFIDENCE_DECAY: float = 0.5            # Exponential decay rate for confidence
+    PREDICTION_MIN_CONFIDENCE: float = 0.1              # Floor confidence for long off-screen players
+    PREDICTION_REENTRY_THRESHOLD: float = 20.0          # Max distance for re-entry matching (0-100 coords)
+    PREDICTION_FRUSTUM_MARGIN: float = 5.0              # Margin added to detected player bounding box (%)
 
     # AI Jersey Detection Settings
     AI_JERSEY_DETECTION_ENABLED: bool = True

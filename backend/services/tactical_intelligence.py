@@ -234,11 +234,11 @@ class TacticalIntelligenceService:
 
         # Attacking opportunities
         if possession_team == "home":
-            alerts.extend(self._detect_space_behind(away_def_line, home_players, ball_position, "home"))
+            alerts.extend(self._detect_space_behind(away_def_line, home_players, ball_position, "home", away_players))
             alerts.extend(self._detect_through_ball_lanes(home_players, away_players, ball_position, "home"))
             alerts.extend(self._detect_overload(home_players, away_players, ball_position, "home"))
         elif possession_team == "away":
-            alerts.extend(self._detect_space_behind(home_def_line, away_players, ball_position, "away"))
+            alerts.extend(self._detect_space_behind(home_def_line, away_players, ball_position, "away", home_players))
             alerts.extend(self._detect_through_ball_lanes(away_players, home_players, ball_position, "away"))
             alerts.extend(self._detect_overload(away_players, home_players, ball_position, "away"))
 
@@ -305,9 +305,15 @@ class TacticalIntelligenceService:
         def_line: Optional[DefensiveLine],
         attacking_players: List[Dict],
         ball_pos: Optional[Tuple[float, float]],
-        attacking_team: str
+        attacking_team: str,
+        defending_players: Optional[List[Dict]] = None,
     ) -> List[TacticalAlert]:
-        """Detect space behind the defensive line."""
+        """Detect space behind the defensive line.
+
+        Confidence-aware: includes off-screen defenders in high-line
+        assessment. Predicted defenders behind the line reduce the
+        space-behind threat proportionally to their confidence.
+        """
         if not def_line or not ball_pos:
             return []
 
@@ -315,15 +321,29 @@ class TacticalIntelligenceService:
 
         # Check if defensive line is high
         if attacking_team == "home":
-            # Away defense is high if their line is closer to their own goal (high x)
             is_high_line = def_line.average_y > 60
             space_zone_x = def_line.average_y + 10
         else:
-            # Home defense is high if their line is closer to away's attacking area (low x)
             is_high_line = def_line.average_y < 40
             space_zone_x = def_line.average_y - 10
 
         if is_high_line:
+            # Check for off-screen defenders covering behind the line
+            # If a predicted defender is deeper than the line, they reduce the threat
+            cover_behind = 0.0
+            if defending_players:
+                for d in defending_players:
+                    d_conf = d.get('confidence', 1.0)
+                    dx = d.get('x', 50)
+                    if attacking_team == "home" and dx > def_line.average_y + 5:
+                        cover_behind += d_conf
+                    elif attacking_team == "away" and dx < def_line.average_y - 5:
+                        cover_behind += d_conf
+
+            # If confident defenders are covering behind the line, suppress alert
+            if cover_behind >= 1.5:
+                return alerts
+
             # Check if attackers can exploit
             fast_attackers = [
                 p for p in attacking_players
@@ -494,7 +514,12 @@ class TacticalIntelligenceService:
         ball_pos: Optional[Tuple[float, float]],
         defending_team: str
     ) -> List[TacticalAlert]:
-        """Detect gaps in the defensive structure."""
+        """Detect gaps in the defensive structure.
+
+        Confidence-aware: gap distance is weighted by the confidence of
+        adjacent defenders. Low-confidence predicted defenders widen the
+        effective gap since their position is uncertain.
+        """
         if len(defending_players) < 4:
             return []
 
@@ -510,7 +535,13 @@ class TacticalIntelligenceService:
 
             gap = abs(p2.get('y', 50) - p1.get('y', 50))
 
-            if gap > self.GAP_THRESHOLD:
+            # Weight gap by defender confidence — low confidence = effectively wider gap
+            p1_conf = p1.get('confidence', 1.0)
+            p2_conf = p2.get('confidence', 1.0)
+            avg_conf = (p1_conf + p2_conf) / 2
+            effective_gap = gap / max(0.3, avg_conf)  # Low confidence amplifies gap
+
+            if effective_gap > self.GAP_THRESHOLD:
                 gap_y = (p1.get('y', 50) + p2.get('y', 50)) / 2
 
                 # Check if attacker is exploiting or near the gap
@@ -545,7 +576,11 @@ class TacticalIntelligenceService:
         attacking_players: List[Dict],
         defending_team: str
     ) -> List[TacticalAlert]:
-        """Detect unmarked attacking players in dangerous positions."""
+        """Detect unmarked attacking players in dangerous positions.
+
+        Confidence-aware: predicted defenders with confidence <= 0.4
+        are not counted as "covering" since their position is uncertain.
+        """
         alerts = []
         marking_distance = 12  # Distance to consider "marked"
 
@@ -564,8 +599,12 @@ class TacticalIntelligenceService:
                 continue
 
             # Check if any defender is marking this attacker
+            # Off-screen defenders with low confidence don't count as covering
             is_marked = False
             for defender in defending_players:
+                d_conf = defender.get('confidence', 1.0)
+                if d_conf <= 0.4:
+                    continue  # Predicted defender too uncertain to count as covering
                 dx, dy = defender.get('x', 50), defender.get('y', 50)
                 dist = math.sqrt((ax - dx)**2 + (ay - dy)**2)
                 if dist < marking_distance:

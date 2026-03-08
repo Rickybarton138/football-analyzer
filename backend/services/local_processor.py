@@ -46,6 +46,9 @@ from services.tactical_events import tactical_detector
 from services.tactical_intelligence import tactical_intelligence
 from services.ai_coach import ai_coach
 
+# VEO Off-Screen Player Prediction
+from services.offscreen_predictor import offscreen_predictor
+
 
 @dataclass
 class Detection:
@@ -1290,30 +1293,54 @@ class LocalVideoProcessor:
                             print(f"[TACTICAL] Error: {e}")
 
                 # Phase 2: Wire tactical intelligence (every 5th frame)
+                # Uses offscreen_predictor to enrich detections to full 22 players
                 if analyzed_count % 5 == 0:
                     try:
-                        # Transform player_detections into tactical_intelligence format
-                        # Expects separate home/away lists with {x, y, jersey_number, has_ball}
-                        ti_home = []
-                        ti_away = []
+                        # Transform detected players to 0-100 coords for offscreen predictor
+                        osp_detections = []
                         for det in (player_detections if model else []):
                             bbox = det.get('bbox', [0, 0, 0, 0])
                             cx = (bbox[0] + bbox[2]) / 2
                             cy = (bbox[1] + bbox[3]) / 2
-                            # Normalize to 0-100 pitch coordinates
                             px = (cx / frame_width) * 100 if frame_width > 0 else 0
                             py = (cy / frame_height) * 100 if frame_height > 0 else 0
                             tid = det.get('track_id')
-                            has_ball = (ball_possessed_by is not None and tid == ball_possessed_by)
                             jersey = ai_jersey_detection_service.get_best_jersey_number(tid) if tid else None
-                            player_entry = {
+                            osp_detections.append({
                                 'x': px, 'y': py,
-                                'jersey_number': jersey or 0,
+                                'team': det.get('team', 'unknown'),
+                                'jersey_number': jersey,
+                                'track_id': tid,
+                            })
+
+                        # Get current formation name from detector
+                        formation_name = None
+                        if formation_detector.home_formations:
+                            formation_name = formation_detector.home_formations[-1].formation.value
+
+                        # Run offscreen predictor: N detections -> 22 enriched players
+                        enriched_players = offscreen_predictor.process_frame(
+                            frame_number=frame_count,
+                            timestamp_ms=int(timestamp * 1000),
+                            detections=osp_detections,
+                            formation_name=formation_name,
+                        )
+
+                        # Build tactical intelligence inputs from enriched 22-player set
+                        ti_home = []
+                        ti_away = []
+                        for ep in enriched_players:
+                            has_ball = (ball_possessed_by is not None and ep.track_id == ball_possessed_by)
+                            player_entry = {
+                                'x': ep.x, 'y': ep.y,
+                                'jersey_number': ep.jersey_number or 0,
                                 'has_ball': has_ball,
+                                'confidence': ep.confidence,
+                                'visibility_state': ep.state.value,
                             }
-                            if det.get('team') == 'home':
+                            if ep.team == 'home':
                                 ti_home.append(player_entry)
-                            elif det.get('team') == 'away':
+                            elif ep.team == 'away':
                                 ti_away.append(player_entry)
 
                         bp = None
