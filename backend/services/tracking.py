@@ -45,6 +45,7 @@ class TrackingService:
         )
 
         self.frame_count = 0
+        self._last_frame_number = -1
 
         # Track metadata (team, color, gk flag) keyed by track_id
         self._track_meta: Dict[int, dict] = {}
@@ -59,6 +60,9 @@ class TrackingService:
 
         # Player count statistics for monitoring
         self.player_count_history: List[int] = []
+
+        # Maximum frame gap before resetting tracker (frames > this apart can't be matched)
+        self._max_frame_gap = 300  # ~10 seconds at 30fps
 
         # Initialize tracker
         self._sv_tracker = None
@@ -105,7 +109,17 @@ class TrackingService:
 
         if not detections:
             self.player_count_history.append(0)
+            self._last_frame_number = frame_number
             return []
+
+        # Detect large frame gaps (e.g. quick_preview at 0.033 FPS = 908 frame gaps)
+        # ByteTrack can't match tracks across such gaps, so reset it
+        if self._last_frame_number >= 0:
+            gap = frame_number - self._last_frame_number
+            if gap > self._max_frame_gap and self._sv_available:
+                self._sv_tracker.reset()
+
+        self._last_frame_number = frame_number
 
         if self._sv_available:
             tracked = self._update_supervision(detections)
@@ -159,6 +173,12 @@ class TrackingService:
 
         # Run ByteTrack
         tracked_dets = self._sv_tracker.update_with_detections(sv_dets)
+
+        # Debug: log if significant filtering occurred
+        if len(tracked_dets) < n * 0.7 and n > 5:
+            print(f"[TRACKING] ByteTrack filtered {n} -> {len(tracked_dets)} "
+                  f"(frame={self.frame_count}, gap from last={self.frame_count - self._last_frame_number if self._last_frame_number >= 0 else 'N/A'})",
+                  flush=True)
 
         # Map tracked results back to DetectedPlayer objects
         tracked_players = []

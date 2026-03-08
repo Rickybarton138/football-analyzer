@@ -39,8 +39,8 @@ class Settings(BaseSettings):
     ANALYSIS_FPS_PREVIEW: float = 0.033  # Quick preview - sample every 30 sec (~6 min CPU, ~2 min GPU)
 
     # Detection Settings
-    DETECTION_CONFIDENCE: float = 0.5
-    TRACKING_CONFIDENCE: float = 0.4
+    DETECTION_CONFIDENCE: float = 0.3      # Lowered from 0.5 to catch distant/small players
+    TRACKING_CONFIDENCE: float = 0.25      # Lowered to track more players consistently
     PLAYER_CLASS_ID: int = 0  # COCO class ID for person
     SPORTS_BALL_CLASS_ID: int = 32  # COCO class ID for sports ball
 

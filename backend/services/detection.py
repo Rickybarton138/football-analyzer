@@ -38,61 +38,80 @@ class DetectionService:
         self.min_acceptable_players = 14
 
     async def initialize(self):
-        """Initialize the detection model."""
+        """Initialize the detection model.
+
+        All heavy initialization runs in a thread pool to avoid blocking
+        the asyncio event loop.
+        """
+        import asyncio
+        loop = asyncio.get_event_loop()
+
         if settings.CLOUD_INFERENCE_ENABLED:
             await self._init_cloud_client()
         else:
             await self._init_local_model()
 
-        # Check if supervision is available
-        try:
-            import supervision as sv
-            self._sv_available = True
-            print("[DETECTION] supervision library available")
-        except ImportError:
-            self._sv_available = False
+        def _init_extras():
+            # Check if supervision is available
+            try:
+                import supervision as sv
+                self._sv_available = True
+                print("[DETECTION] supervision library available", flush=True)
+            except ImportError:
+                self._sv_available = False
 
-        # Try to initialize SigLIP team classifier
-        try:
-            from services.team_classifier import TeamClassifier
-            self._team_classifier = TeamClassifier()
-            print("[DETECTION] SigLIP team classifier available (lazy init)")
-        except ImportError:
-            print("[DETECTION] SigLIP team classifier not available, using LAB color fallback")
+            # Try to initialize SigLIP team classifier
+            try:
+                from services.team_classifier import TeamClassifier
+                self._team_classifier = TeamClassifier()
+                print("[DETECTION] SigLIP team classifier available (lazy init)", flush=True)
+            except ImportError:
+                print("[DETECTION] SigLIP team classifier not available, using LAB color fallback", flush=True)
+
+        await loop.run_in_executor(None, _init_extras)
+        print("[DETECTION] Initialization complete", flush=True)
 
     async def _init_local_model(self):
-        """Initialize local YOLO model with fallback chain."""
-        try:
-            from ultralytics import YOLO
+        """Initialize local YOLO model with fallback chain.
 
-            # Select model chain based on GPU availability
-            model_chain = settings.YOLO_MODEL_CHAIN if settings.USE_GPU else settings.YOLO_MODEL_CHAIN_CPU
+        Runs model loading in a thread pool to avoid blocking the event loop,
+        as YOLO() constructor can take several seconds.
+        """
+        import asyncio
 
-            for model_path in model_chain:
-                try:
-                    print(f"[DETECTION] Trying model: {model_path}")
-                    self.model = YOLO(model_path)
-                    self.model_name = model_path
+        def _load_model():
+            try:
+                from ultralytics import YOLO
 
-                    if not settings.USE_GPU:
-                        self.model.to('cpu')
-                        print(f"[DETECTION] Model loaded: {model_path} (CPU)")
-                    else:
-                        print(f"[DETECTION] Model loaded: {model_path} (GPU)")
-                    break
-                except Exception as e:
-                    print(f"[DETECTION] Failed to load {model_path}: {e}")
-                    continue
+                model_chain = settings.YOLO_MODEL_CHAIN if settings.USE_GPU else settings.YOLO_MODEL_CHAIN_CPU
 
-            if self.model is None:
-                print("[DETECTION] All models in fallback chain failed. Using mock detection.")
+                for model_path in model_chain:
+                    try:
+                        print(f"[DETECTION] Trying model: {model_path}", flush=True)
+                        model = YOLO(model_path)
 
-        except ImportError as e:
-            print(f"Warning: ultralytics not installed ({e}). Using mock detection.")
-            self.model = None
-        except Exception as e:
-            print(f"Warning: Failed to load YOLO model ({e}). Using mock detection.")
-            self.model = None
+                        if not settings.USE_GPU:
+                            model.to('cpu')
+                            print(f"[DETECTION] Model loaded: {model_path} (CPU)", flush=True)
+                        else:
+                            print(f"[DETECTION] Model loaded: {model_path} (GPU)", flush=True)
+                        return model, model_path
+                    except Exception as e:
+                        print(f"[DETECTION] Failed to load {model_path}: {e}", flush=True)
+                        continue
+
+                print("[DETECTION] All models in fallback chain failed. Using mock detection.", flush=True)
+                return None, "none"
+
+            except ImportError as e:
+                print(f"Warning: ultralytics not installed ({e}). Using mock detection.", flush=True)
+                return None, "none"
+            except Exception as e:
+                print(f"Warning: Failed to load YOLO model ({e}). Using mock detection.", flush=True)
+                return None, "none"
+
+        loop = asyncio.get_event_loop()
+        self.model, self.model_name = await loop.run_in_executor(None, _load_model)
 
     async def _init_cloud_client(self):
         """Initialize cloud inference client."""
@@ -118,12 +137,12 @@ class DetectionService:
         else:
             return await self._detect_local(frame)
 
-    async def _detect_local(self, frame: np.ndarray) -> List[DetectedPlayer]:
+    async def _detect_local(self, frame: np.ndarray, conf_override: float = None) -> List[DetectedPlayer]:
         """
         Run detection locally using YOLO at native 1280 resolution.
 
-        Simplified from multi-scale approach - modern YOLO handles scale
-        natively at imgsz=1280 which is sufficient for full-pitch footage.
+        Includes adaptive retry: if fewer than expected players detected,
+        retries with progressively lower confidence thresholds.
         """
         if self.model is None:
             return self._mock_detection(frame)
@@ -133,16 +152,16 @@ class DetectionService:
 
         # Determine classes to detect
         if is_football_model:
-            # Fine-tuned model has football-specific classes: ball, goalkeeper, player, referee
-            classes = None  # Use all classes from the football model
+            classes = None  # Football model: ball, goalkeeper, player, referee
         else:
-            # COCO model: only detect persons
-            classes = [settings.PLAYER_CLASS_ID]
+            classes = [settings.PLAYER_CLASS_ID]  # COCO: person only
+
+        conf = conf_override or settings.DETECTION_CONFIDENCE
 
         # Single-pass detection at native resolution
         results = self.model(
             frame,
-            conf=settings.DETECTION_CONFIDENCE,
+            conf=conf,
             classes=classes,
             verbose=False,
             imgsz=settings.DETECTION_IMGSZ
@@ -154,10 +173,25 @@ class DetectionService:
         else:
             detections = self._parse_manual(results, frame, width, height, is_football_model)
 
+        # Adaptive retry: if too few players, try lower confidence
+        if len(detections) < self.MIN_EXPECTED_PLAYERS and conf_override is None:
+            retry_conf = max(0.2, conf - 0.15)
+            retry_results = self.model(
+                frame, conf=retry_conf, classes=classes,
+                verbose=False, imgsz=settings.DETECTION_IMGSZ
+            )
+            if self._sv_available:
+                retry_dets = self._parse_with_supervision(retry_results, frame, is_football_model)
+            else:
+                retry_dets = self._parse_manual(retry_results, frame, width, height, is_football_model)
+
+            if len(retry_dets) > len(detections):
+                print(f"[DETECTION] Retry at conf={retry_conf:.2f}: {len(retry_dets)} players (was {len(detections)})")
+                detections = retry_dets
+
         if len(detections) < self.MIN_EXPECTED_PLAYERS:
             print(f"[DETECTION] Warning: Only detected {len(detections)} players (expected {self.MIN_EXPECTED_PLAYERS}+)")
 
-        print(f"[DETECTION] {len(detections)} players detected (model: {self.model_name})")
         return detections
 
     def _parse_with_supervision(
@@ -517,14 +551,56 @@ class DetectionService:
         lab_pixel = cv2.cvtColor(bgr_pixel, cv2.COLOR_BGR2LAB)
         return lab_pixel.reshape(3).astype(float)
 
+    def _bgr_to_hsv(self, bgr_color: np.ndarray) -> np.ndarray:
+        """Convert a single BGR color to HSV."""
+        bgr_pixel = bgr_color.astype(np.uint8).reshape(1, 1, 3)
+        hsv_pixel = cv2.cvtColor(bgr_pixel, cv2.COLOR_BGR2HSV)
+        return hsv_pixel.reshape(3)
+
+    def _hue_distance(self, h1: int, h2: int) -> int:
+        """Circular hue distance (OpenCV hue range 0-180)."""
+        return min(abs(h1 - h2), 180 - abs(h1 - h2))
+
     def _classify_team(self, jersey_color: Optional[np.ndarray]) -> TeamSide:
-        """Classify team based on jersey color using CIELAB distance."""
+        """Classify team using HSV hue distance (primary) with LAB fallback.
+
+        HSV hue-based classification works far better than LAB for dark jerseys
+        (common in VEO footage) because LAB's lightness channel dominates when
+        both teams have similar dark colors.
+        """
         if jersey_color is None:
             return TeamSide.UNKNOWN
 
         if self.home_color is None or self.away_color is None:
             return TeamSide.UNKNOWN
 
+        color_hsv = self._bgr_to_hsv(jersey_color)
+        home_hsv = self._bgr_to_hsv(self.home_color)
+        away_hsv = self._bgr_to_hsv(self.away_color)
+
+        h, s = int(color_hsv[0]), int(color_hsv[1])
+        h_home, h_away = int(home_hsv[0]), int(away_hsv[0])
+
+        hue_dist_home = self._hue_distance(h, h_home)
+        hue_dist_away = self._hue_distance(h, h_away)
+        team_hue_sep = self._hue_distance(h_home, h_away)
+
+        # Use hue if the color has enough saturation and teams are hue-separable
+        if s > 30 and team_hue_sep > 15:
+            min_hue = min(hue_dist_home, hue_dist_away)
+            max_hue = max(hue_dist_home, hue_dist_away)
+
+            # Too far from both teams = probably referee or other
+            if min_hue > 70:
+                return TeamSide.UNKNOWN
+
+            # If hue distances are very similar, fall through to LAB
+            if max_hue > 0 and min_hue / max_hue > 0.85:
+                pass  # ambiguous in hue, try LAB below
+            else:
+                return TeamSide.HOME if hue_dist_home < hue_dist_away else TeamSide.AWAY
+
+        # LAB fallback for low-saturation or hue-ambiguous colors
         color_lab = self._bgr_to_lab(jersey_color)
         home_lab = self._bgr_to_lab(self.home_color)
         away_lab = self._bgr_to_lab(self.away_color)

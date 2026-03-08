@@ -567,6 +567,10 @@ async def process_video(
             TeamSide.AWAY if my_team == TeamSide.HOME else TeamSide.HOME
         ) if analysis_mode == AnalysisMode.OPPONENT else None
 
+        # Team color auto-detection: collect jersey colors from early frames
+        color_samples_for_auto = []
+        team_colors_auto_detected = False
+
         async for frame_data in frame_generator:
             frame_count += 1
             job.current_frame = frame_count
@@ -579,8 +583,158 @@ async def process_video(
             # Run detection
             detections = await services["detection"].detect(frame_data["frame"])
 
-            # Run tracking
-            tracked = await services["tracking"].update(detections, frame_data["frame_number"])
+            # Pitch boundary filtering: remove off-pitch detections (sideline people)
+            frame = frame_data["frame"]
+            frame_h, frame_w = frame.shape[:2]
+            on_pitch_detections = []
+            for det in detections:
+                cy = (det.bbox.y1 + det.bbox.y2) / 2
+                cx = (det.bbox.x1 + det.bbox.x2) / 2
+                bh = det.bbox.y2 - det.bbox.y1
+                y_ratio = cy / frame_h
+                h_ratio = bh / frame_h
+
+                # Skip detections above pitch (crowd/sky) or below (sideline/boards)
+                if y_ratio < 0.03 or y_ratio > 0.92:
+                    continue
+                # Sideline zone: extra validation for bottom strip
+                if y_ratio > 0.85:
+                    if h_ratio < 0.04:  # Too small = coaching staff
+                        continue
+                    x_ratio = cx / frame_w
+                    if x_ratio < 0.05 or x_ratio > 0.95:  # Corner = linesman
+                        continue
+                on_pitch_detections.append(det)
+
+            if frame_count <= 3:
+                filtered_count = len(detections) - len(on_pitch_detections)
+                if filtered_count > 0:
+                    print(f"[PROCESS] Frame {frame_count}: Filtered {filtered_count} off-pitch detections "
+                          f"({len(on_pitch_detections)} on-pitch)")
+
+            detections = on_pitch_detections
+
+            # Auto-detect team colors: collect quality jersey colors, then KMeans
+            # Keep collecting samples until we get a good calibration
+            for det in detections:
+                if det.jersey_color:
+                    c = det.jersey_color
+                    b, g, r = c[0], c[1], c[2]
+                    # Filter non-jersey colors
+                    is_grass = (g > r * 0.85 and g > b * 0.85 and g > 40)
+                    is_dark = (r < 40 and g < 40 and b < 40)
+                    is_bright = (r > 210 and g > 210 and b > 210)
+                    max_ch = max(r, g, b)
+                    min_ch = min(r, g, b)
+                    sat = (max_ch - min_ch) / max(max_ch, 1)
+                    is_gray = sat < 0.15 and max_ch > 50
+                    if not is_grass and not is_dark and not is_bright and not is_gray:
+                        color_samples_for_auto.append(c)
+
+            # Attempt calibration when we have enough samples
+            # Cluster in LAB space for perceptually uniform distance
+            need_calibration = not team_colors_auto_detected
+            if team_colors_auto_detected and hasattr(services["detection"], '_last_cluster_ratio'):
+                ratio = services["detection"]._last_cluster_ratio
+                if ratio < 0.2 and len(color_samples_for_auto) > 150:
+                    need_calibration = True  # Re-calibrate with more data
+
+            if need_calibration and len(color_samples_for_auto) >= 40 and frame_count >= 3:
+                try:
+                    import numpy as np
+                    import cv2
+                    from sklearn.cluster import KMeans
+
+                    bgr_arr = np.array(color_samples_for_auto, dtype=np.uint8)
+
+                    # Convert to HSV — cluster on Hue which separates jersey colors
+                    # even when both teams have dark jerseys (LAB fails because L dominates)
+                    hsv_arr = cv2.cvtColor(bgr_arr.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+
+                    # Filter out low-saturation samples — hue is meaningless for grays
+                    sat_mask = hsv_arr[:, 1] > 40
+                    hsv_filtered = hsv_arr[sat_mask]
+                    bgr_filtered = bgr_arr[sat_mask]
+
+                    if len(hsv_filtered) < 20:
+                        hsv_filtered = hsv_arr
+                        bgr_filtered = bgr_arr
+
+                    # Cluster on Hue (single channel) — separates jersey colors cleanly
+                    hue_values = hsv_filtered[:, 0].reshape(-1, 1).astype(float)
+                    kmeans = KMeans(n_clusters=2, n_init=10, random_state=42)
+                    kmeans.fit(hue_values)
+
+                    n_c1 = int(np.sum(kmeans.labels_ == 0))
+                    n_c2 = int(np.sum(kmeans.labels_ == 1))
+                    total_samples = n_c1 + n_c2
+                    min_cluster = min(n_c1, n_c2)
+                    cluster_ratio = min_cluster / max(total_samples, 1)
+
+                    # Hue separation (in OpenCV hue range 0-180)
+                    hue_sep = abs(float(kmeans.cluster_centers_[0][0]) - float(kmeans.cluster_centers_[1][0]))
+
+                    # Compute BGR centroids from each cluster
+                    c1_bgr_mean = bgr_filtered[kmeans.labels_ == 0].mean(axis=0).astype(np.uint8)
+                    c2_bgr_mean = bgr_filtered[kmeans.labels_ == 1].mean(axis=0).astype(np.uint8)
+
+                    # Accept if hue clusters are well-separated and balanced
+                    # Strong hue separation (>80) allows lower ratio threshold
+                    min_ratio = 0.06 if hue_sep > 80 else 0.12
+                    if hue_sep >= 15 and cluster_ratio >= min_ratio:
+                        await services["detection"].set_team_colors(
+                            home_color=c1_bgr_mean.tolist(),
+                            away_color=c2_bgr_mean.tolist()
+                        )
+                        services["detection"]._last_cluster_ratio = cluster_ratio
+                        team_colors_auto_detected = True
+
+                        print(f"[PROCESS] Team colors (Hue clustering, {total_samples} samples): "
+                              f"Team1 BGR={c1_bgr_mean.tolist()} ({n_c1}, hue={kmeans.cluster_centers_[0][0]:.0f}), "
+                              f"Team2 BGR={c2_bgr_mean.tolist()} ({n_c2}, hue={kmeans.cluster_centers_[1][0]:.0f}), "
+                              f"ratio={cluster_ratio:.2f}, hue_sep={hue_sep:.0f}", flush=True)
+
+                        # Re-run detection on current frame with team colors set
+                        detections = await services["detection"].detect(frame_data["frame"])
+                        on_pitch = []
+                        for det in detections:
+                            cy = (det.bbox.y1 + det.bbox.y2) / 2
+                            cx = (det.bbox.x1 + det.bbox.x2) / 2
+                            bh = det.bbox.y2 - det.bbox.y1
+                            y_ratio = cy / frame_h
+                            if y_ratio < 0.03 or y_ratio > 0.92:
+                                continue
+                            if y_ratio > 0.85:
+                                h_ratio = bh / frame_h
+                                if h_ratio < 0.04:
+                                    continue
+                                x_ratio = cx / frame_w
+                                if x_ratio < 0.05 or x_ratio > 0.95:
+                                    continue
+                            on_pitch.append(det)
+                        detections = on_pitch
+                    else:
+                        if not team_colors_auto_detected:
+                            print(f"[PROCESS] Delaying calibration: "
+                                  f"ratio={cluster_ratio:.2f}, hue_sep={hue_sep:.0f}, "
+                                  f"samples={total_samples} (S>40 filtered from {len(color_samples_for_auto)})",
+                                  flush=True)
+                except Exception as e:
+                    print(f"[PROCESS] Team color auto-detection failed: {e}", flush=True)
+
+            # Log detection quality for first few frames
+            if frame_count <= 5:
+                n_home = sum(1 for d in detections if d.team == TeamSide.HOME)
+                n_away = sum(1 for d in detections if d.team == TeamSide.AWAY)
+                n_unk = sum(1 for d in detections if d.team == TeamSide.UNKNOWN)
+                n_gk = sum(1 for d in detections if d.is_goalkeeper)
+                print(f"[PROCESS] Frame {frame_count}: {len(detections)} players "
+                      f"(home={n_home}, away={n_away}, unknown={n_unk}, gk={n_gk})")
+
+            # Run tracking — use original_frame_number so ByteTrack can detect
+            # large gaps (e.g. quick_preview samples every 908 frames)
+            tracking_frame = frame_data.get("original_frame_number", frame_data["frame_number"])
+            tracked = await services["tracking"].update(detections, tracking_frame)
 
             # AI Jersey Detection - run on tracked players
             try:
@@ -664,17 +818,26 @@ async def process_video(
                     frame_number=frame_data["frame_number"],
                     timestamp_ms=frame_data["timestamp_ms"]
                 )
+
+                # Bridge: if event_detection found team colors and main detection hasn't,
+                # share the colors so per-frame team classification works immediately
+                if (not team_colors_auto_detected
+                        and event_detection_service.team_colors_initialized
+                        and event_detection_service.home_team_color is not None):
+                    evt_home = event_detection_service.home_team_color.tolist()
+                    evt_away = event_detection_service.away_team_color.tolist()
+                    await services["detection"].set_team_colors(evt_home, evt_away)
+                    team_colors_auto_detected = True
+                    print(f"[PROCESS] Using event_detection colors: "
+                          f"Home BGR={evt_home}, Away BGR={evt_away}", flush=True)
+
                 if events:
                     if frame_count <= 10:
                         print(f"[EVENTS] Detected {len(events)} events at frame {frame_data['frame_number']}")
 
                     # Record events in player highlights service for clip generation
-                    # Note: player_highlights uses jersey_number as key, but we now use persistent player_ids
-                    # For simplicity, we'll use track_id as a pseudo-jersey number since jersey OCR may not work
                     for event in events:
                         try:
-                            # Event.player_id is the track_id
-                            # Use negative track_id as pseudo-jersey to avoid collision with real jerseys
                             if event.player_id:
                                 pseudo_jersey = -abs(event.player_id)
                                 player_highlights_service.record_event(event, player_jersey=pseudo_jersey)
