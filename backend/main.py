@@ -5,13 +5,17 @@ A computer vision-powered application for analyzing football matches,
 providing both real-time coaching assistance and post-match analytics.
 """
 import asyncio
+import math
+import shutil
+import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from datetime import datetime
 import json
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -39,6 +43,7 @@ from services.analytics import AnalyticsEngine
 from ai.tactical_analyzer import TacticalAnalyzer
 from ai.recommendation import RecommendationEngine
 from ai.alerts import AlertManager
+from services.ai_coaching_engine import ai_coaching_engine
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -80,6 +85,31 @@ _services: Dict[str, any] = {}
 
 # Analysis cache to avoid reprocessing on every request
 _analysis_cache: Dict[str, Dict] = {}
+
+# Chunked upload sessions
+@dataclass
+class UploadSession:
+    upload_id: str
+    filename: str
+    total_size: int
+    chunk_size: int
+    total_chunks: int
+    received_chunks: Set[int] = field(default_factory=set)
+    created_at: float = field(default_factory=time.time)
+    match_half: str = "full"           # "full", "first", "second"
+    match_id: Optional[str] = None     # Links halves together
+    metadata: Optional[dict] = None    # Match metadata from form
+
+upload_sessions: Dict[str, UploadSession] = {}
+
+# Match half linkage: match_id -> {"first": video_id, "second": video_id}
+match_halves_store: Dict[str, Dict[str, str]] = {}
+
+# URL import jobs: import_id -> {status, progress_pct, video_id, error}
+import_jobs: Dict[str, dict] = {}
+
+# VEO API token (stored in memory after connect)
+veo_api_token: Optional[str] = settings.VEO_API_TOKEN
 
 
 def _populate_visualization_from_analysis(analysis_result: Dict):
@@ -403,6 +433,466 @@ async def upload_video(
         status="uploaded"
     )
 
+
+# ============== Chunked Resumable Upload ==============
+
+class ChunkedUploadInitRequest(BaseModel):
+    filename: str
+    total_size: int
+    match_half: str = "full"     # "full", "first", "second"
+    match_id: Optional[str] = None
+    metadata: Optional[dict] = None
+
+@app.post("/api/video/upload/init")
+async def chunked_upload_init(req: ChunkedUploadInitRequest):
+    """Initialize a chunked upload session."""
+    # Validate extension
+    ext = Path(req.filename).suffix.lower()
+    if ext not in settings.SUPPORTED_VIDEO_FORMATS:
+        raise HTTPException(400, f"Unsupported format. Use: {settings.SUPPORTED_VIDEO_FORMATS}")
+
+    # Validate size
+    max_bytes = settings.UPLOAD_MAX_FILE_SIZE_MB * 1024 * 1024
+    if req.total_size > max_bytes:
+        raise HTTPException(400, f"File too large. Max: {settings.UPLOAD_MAX_FILE_SIZE_MB} MB")
+
+    if req.total_size <= 0:
+        raise HTTPException(400, "Invalid file size")
+
+    # Validate match_half
+    if req.match_half not in ("full", "first", "second"):
+        raise HTTPException(400, "match_half must be 'full', 'first', or 'second'")
+
+    upload_id = str(uuid.uuid4())
+    chunk_size = settings.UPLOAD_CHUNK_SIZE_MB * 1024 * 1024
+    total_chunks = math.ceil(req.total_size / chunk_size)
+
+    # Create temp directory for chunks
+    temp_dir = settings.UPLOAD_TEMP_DIR / upload_id
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    session = UploadSession(
+        upload_id=upload_id,
+        filename=req.filename,
+        total_size=req.total_size,
+        chunk_size=chunk_size,
+        total_chunks=total_chunks,
+        match_half=req.match_half,
+        match_id=req.match_id,
+        metadata=req.metadata,
+    )
+    upload_sessions[upload_id] = session
+
+    return {
+        "upload_id": upload_id,
+        "chunk_size": chunk_size,
+        "total_chunks": total_chunks,
+    }
+
+
+@app.put("/api/video/upload/{upload_id}/chunk/{chunk_index}")
+async def chunked_upload_chunk(upload_id: str, chunk_index: int, request: Request):
+    """Upload a single chunk of a file."""
+    session = upload_sessions.get(upload_id)
+    if not session:
+        raise HTTPException(404, "Upload session not found")
+
+    if chunk_index < 0 or chunk_index >= session.total_chunks:
+        raise HTTPException(400, f"Invalid chunk index. Must be 0-{session.total_chunks - 1}")
+
+    # Idempotent: skip if already received
+    if chunk_index in session.received_chunks:
+        return {
+            "received": chunk_index,
+            "total_received": len(session.received_chunks),
+            "total_chunks": session.total_chunks,
+        }
+
+    # Read raw bytes from request body
+    body = await request.body()
+    if not body:
+        raise HTTPException(400, "Empty chunk body")
+
+    # Save chunk to temp dir
+    chunk_path = settings.UPLOAD_TEMP_DIR / upload_id / f"chunk_{chunk_index:05d}.bin"
+    async with aiofiles.open(chunk_path, 'wb') as f:
+        await f.write(body)
+
+    session.received_chunks.add(chunk_index)
+
+    return {
+        "received": chunk_index,
+        "total_received": len(session.received_chunks),
+        "total_chunks": session.total_chunks,
+    }
+
+
+@app.get("/api/video/upload/{upload_id}/status")
+async def chunked_upload_status(upload_id: str):
+    """Get status of a chunked upload session (which chunks received)."""
+    session = upload_sessions.get(upload_id)
+    if not session:
+        raise HTTPException(404, "Upload session not found")
+
+    return {
+        "upload_id": upload_id,
+        "filename": session.filename,
+        "total_size": session.total_size,
+        "chunk_size": session.chunk_size,
+        "total_chunks": session.total_chunks,
+        "received_chunks": sorted(session.received_chunks),
+        "complete": len(session.received_chunks) == session.total_chunks,
+        "match_half": session.match_half,
+    }
+
+
+@app.post("/api/video/upload/{upload_id}/complete")
+async def chunked_upload_complete(upload_id: str):
+    """Concatenate all chunks into the final video file."""
+    session = upload_sessions.get(upload_id)
+    if not session:
+        raise HTTPException(404, "Upload session not found")
+
+    # Verify all chunks received
+    missing = set(range(session.total_chunks)) - session.received_chunks
+    if missing:
+        raise HTTPException(
+            400,
+            f"Missing {len(missing)} chunks: {sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}"
+        )
+
+    # Generate video ID and final path
+    video_id = str(uuid.uuid4())
+    ext = Path(session.filename).suffix.lower()
+    final_path = settings.UPLOAD_DIR / f"{video_id}{ext}"
+
+    # Concatenate chunks in order
+    temp_dir = settings.UPLOAD_TEMP_DIR / upload_id
+    try:
+        async with aiofiles.open(final_path, 'wb') as out_file:
+            for i in range(session.total_chunks):
+                chunk_path = temp_dir / f"chunk_{i:05d}.bin"
+                async with aiofiles.open(chunk_path, 'rb') as chunk_file:
+                    data = await chunk_file.read()
+                    await out_file.write(data)
+    except Exception as e:
+        # Clean up partial file on failure
+        if final_path.exists():
+            final_path.unlink()
+        raise HTTPException(500, f"Failed to assemble video: {str(e)}")
+
+    # Clean up temp chunks
+    shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # Extract video metadata
+    services = get_services()
+    video_meta = await services["video"].get_video_metadata(final_path)
+
+    # Store match metadata if provided
+    if session.metadata:
+        match_metadata_store[video_id] = session.metadata
+
+    # Link halves by match_id
+    if session.match_half in ("first", "second") and session.match_id:
+        if session.match_id not in match_halves_store:
+            match_halves_store[session.match_id] = {}
+        match_halves_store[session.match_id][session.match_half] = video_id
+
+    # Initialize processing status
+    processing_jobs[video_id] = ProcessingStatus(
+        video_id=video_id,
+        status="uploaded",
+        total_frames=video_meta.get("total_frames", 0)
+    )
+
+    # Clean up session
+    del upload_sessions[upload_id]
+
+    return VideoUploadResponse(
+        video_id=video_id,
+        filename=session.filename,
+        duration_ms=video_meta.get("duration_ms", 0),
+        fps=video_meta.get("fps", 0),
+        resolution=(video_meta.get("width", 0), video_meta.get("height", 0)),
+        status="uploaded"
+    )
+
+
+@app.get("/api/match/{match_id}/halves")
+async def get_match_halves(match_id: str):
+    """Get linked video IDs for a match uploaded in halves."""
+    halves = match_halves_store.get(match_id)
+    if not halves:
+        raise HTTPException(404, "No halves found for this match")
+
+    result = {"match_id": match_id}
+    for half_key in ("first", "second"):
+        vid = halves.get(half_key)
+        if vid:
+            status = processing_jobs.get(vid)
+            result[half_key] = {
+                "video_id": vid,
+                "status": status.status if status else "unknown",
+                "progress_pct": status.progress_pct if status else 0,
+            }
+    return result
+
+
+# ============== URL Import ==============
+
+class VideoImportRequest(BaseModel):
+    url: str
+    metadata: Optional[dict] = None
+    match_half: str = "full"
+    match_id: Optional[str] = None
+
+
+def _resolve_download_url(url: str) -> tuple:
+    """Resolve sharing links to direct download URLs. Returns (direct_url, suggested_filename)."""
+    import re
+
+    # Google Drive: drive.google.com/file/d/{id}/view
+    gd_match = re.search(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)', url)
+    if gd_match:
+        file_id = gd_match.group(1)
+        return (f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t", f"{file_id}.mp4")
+
+    # Dropbox: replace dl=0 with dl=1
+    if 'dropbox.com' in url:
+        direct = url.replace('dl=0', 'dl=1')
+        if 'dl=1' not in direct:
+            sep = '&' if '?' in direct else '?'
+            direct += f'{sep}dl=1'
+        filename = url.split('/')[-1].split('?')[0] or 'dropbox_video.mp4'
+        return (direct, filename)
+
+    # Direct URL — extract filename from path
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    filename = parsed.path.split('/')[-1] or 'imported_video.mp4'
+    if '.' not in filename:
+        filename += '.mp4'
+    return (url, filename)
+
+
+async def _download_video_from_url(import_id: str, url: str, metadata: Optional[dict],
+                                    match_half: str, match_id: Optional[str]):
+    """Background task: download video from URL, extract metadata, store."""
+    import httpx
+
+    try:
+        direct_url, suggested_filename = _resolve_download_url(url)
+        ext = Path(suggested_filename).suffix or '.mp4'
+        video_id = str(uuid.uuid4())
+        video_path = settings.UPLOAD_DIR / f"{video_id}{ext}"
+
+        import_jobs[import_id]["status"] = "downloading"
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(
+            settings.IMPORT_DOWNLOAD_TIMEOUT_S, connect=30.0
+        )) as client:
+            async with client.stream("GET", direct_url) as response:
+                if response.status_code >= 400:
+                    import_jobs[import_id] = {"status": "failed", "progress_pct": 0, "video_id": None,
+                                              "error": f"Download failed: HTTP {response.status_code}"}
+                    return
+
+                total = int(response.headers.get("content-length", 0))
+                downloaded = 0
+
+                async with aiofiles.open(str(video_path), "wb") as f:
+                    async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):  # 1MB chunks
+                        await f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            import_jobs[import_id]["progress_pct"] = round((downloaded / total) * 90)
+                        else:
+                            import_jobs[import_id]["progress_pct"] = min(80, downloaded // (1024 * 1024))
+
+        # Extract metadata
+        import_jobs[import_id]["status"] = "processing_metadata"
+        import_jobs[import_id]["progress_pct"] = 92
+
+        services = get_services()
+        vid_metadata = await services["video"].get_video_metadata(video_path)
+
+        # Store in match_metadata_store
+        if metadata:
+            match_metadata_store[video_id] = metadata
+
+        # Link halves if applicable
+        if match_id and match_half in ("first", "second"):
+            if match_id not in match_halves_store:
+                match_halves_store[match_id] = {}
+            match_halves_store[match_id][match_half] = video_id
+
+        # Initialize processing status
+        processing_jobs[video_id] = ProcessingStatus(
+            video_id=video_id,
+            status="uploaded",
+            total_frames=vid_metadata.get("total_frames", 0)
+        )
+
+        import_jobs[import_id] = {
+            "status": "ready",
+            "progress_pct": 100,
+            "video_id": video_id,
+            "error": None,
+            "filename": suggested_filename,
+            "duration_ms": vid_metadata.get("duration_ms", 0),
+            "fps": vid_metadata.get("fps", 0),
+            "resolution": [vid_metadata.get("width", 0), vid_metadata.get("height", 0)],
+        }
+
+    except Exception as e:
+        # Clean up partial file
+        if 'video_path' in dir() and video_path.exists():
+            video_path.unlink(missing_ok=True)
+        import_jobs[import_id] = {"status": "failed", "progress_pct": 0, "video_id": None,
+                                  "error": str(e)}
+
+
+@app.post("/api/video/import")
+async def import_video_from_url(req: VideoImportRequest, background_tasks: BackgroundTasks):
+    """Import a video from URL (Google Drive, Dropbox, or direct link)."""
+    import re
+
+    url = req.url.strip()
+    if not url or not re.match(r'^https?://', url):
+        raise HTTPException(400, "Invalid URL. Must start with http:// or https://")
+
+    import_id = str(uuid.uuid4())
+    import_jobs[import_id] = {"status": "downloading", "progress_pct": 0, "video_id": None, "error": None}
+
+    background_tasks.add_task(
+        _download_video_from_url, import_id, url, req.metadata, req.match_half, req.match_id
+    )
+
+    return {"import_id": import_id, "status": "downloading"}
+
+
+@app.get("/api/video/import/{import_id}/status")
+async def get_import_status(import_id: str):
+    """Poll the status of a URL import job."""
+    job = import_jobs.get(import_id)
+    if not job:
+        raise HTTPException(404, "Import job not found")
+    return job
+
+
+# ============== VEO API Integration ==============
+
+class VeoConnectRequest(BaseModel):
+    token: str
+
+
+@app.post("/api/veo/connect")
+async def veo_connect(req: VeoConnectRequest):
+    """Validate VEO API token and store it."""
+    import httpx
+    global veo_api_token
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{settings.VEO_API_BASE_URL}/users/me",
+                headers={"Authorization": f"Bearer {req.token}"}
+            )
+            if resp.status_code == 401:
+                raise HTTPException(401, "Invalid VEO token")
+            if resp.status_code >= 400:
+                raise HTTPException(resp.status_code, f"VEO API error: {resp.status_code}")
+
+            user_info = resp.json()
+            veo_api_token = req.token
+            return {"connected": True, "user_info": user_info}
+    except httpx.RequestError as e:
+        raise HTTPException(502, f"Cannot reach VEO API: {str(e)}")
+
+
+@app.get("/api/veo/status")
+async def veo_status():
+    """Check if VEO is connected."""
+    return {"connected": veo_api_token is not None}
+
+
+@app.get("/api/veo/recordings")
+async def veo_recordings(page: int = 1, per_page: int = 20):
+    """List recordings from connected VEO account."""
+    import httpx
+
+    if not veo_api_token:
+        raise HTTPException(401, "VEO not connected. Call POST /api/veo/connect first.")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{settings.VEO_API_BASE_URL}/videos",
+                params={"page": page, "per_page": per_page},
+                headers={"Authorization": f"Bearer {veo_api_token}"}
+            )
+            if resp.status_code == 401:
+                raise HTTPException(401, "VEO token expired. Please reconnect.")
+            if resp.status_code >= 400:
+                raise HTTPException(resp.status_code, f"VEO API error: {resp.status_code}")
+
+            data = resp.json()
+            # Normalize response — VEO API may vary, handle common shapes
+            recordings = []
+            items = data if isinstance(data, list) else data.get("items", data.get("videos", data.get("data", [])))
+            for item in items:
+                recordings.append({
+                    "id": item.get("id"),
+                    "title": item.get("title", item.get("name", "Untitled")),
+                    "date": item.get("created_at", item.get("date", "")),
+                    "duration": item.get("duration", item.get("length", 0)),
+                    "thumbnail_url": item.get("thumbnail_url", item.get("thumbnail", "")),
+                })
+            return {"recordings": recordings, "page": page, "per_page": per_page}
+    except httpx.RequestError as e:
+        raise HTTPException(502, f"Cannot reach VEO API: {str(e)}")
+
+
+@app.post("/api/veo/import/{recording_id}")
+async def veo_import_recording(recording_id: str, background_tasks: BackgroundTasks):
+    """Import a specific VEO recording by ID."""
+    import httpx
+
+    if not veo_api_token:
+        raise HTTPException(401, "VEO not connected. Call POST /api/veo/connect first.")
+
+    try:
+        # Get download URL from VEO API
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{settings.VEO_API_BASE_URL}/videos/{recording_id}",
+                headers={"Authorization": f"Bearer {veo_api_token}"}
+            )
+            if resp.status_code >= 400:
+                raise HTTPException(resp.status_code, f"VEO API error: {resp.status_code}")
+
+            video_data = resp.json()
+            download_url = video_data.get("download_url", video_data.get("url", video_data.get("video_url")))
+            if not download_url:
+                raise HTTPException(400, "No download URL available for this recording")
+
+        # Reuse URL import pipeline
+        import_id = str(uuid.uuid4())
+        import_jobs[import_id] = {"status": "downloading", "progress_pct": 0, "video_id": None, "error": None}
+
+        background_tasks.add_task(
+            _download_video_from_url, import_id, download_url,
+            {"source": "veo", "veo_recording_id": recording_id,
+             "title": video_data.get("title", "VEO Recording")},
+            "full", None
+        )
+
+        return {"import_id": import_id, "status": "downloading"}
+    except httpx.RequestError as e:
+        raise HTTPException(502, f"Cannot reach VEO API: {str(e)}")
+
+
+# ============== Legacy Upload (backward compat) ==============
 
 @app.post("/api/video/{video_id}/register", response_model=VideoUploadResponse)
 async def register_existing_video(video_id: str, filename: str = "video.mp4"):
@@ -8721,6 +9211,233 @@ async def get_player_timeline(video_id: str, player_id: str):
     }
 
 
+# ============== Player IDP + Manager MDP Endpoints ==============
+
+
+class IDPRequest(BaseModel):
+    position: str = "CM"
+    player_name: str = ""
+    team: str = "home"
+
+
+class MDPRequest(BaseModel):
+    match_id: Optional[str] = None
+
+
+@app.post("/api/player/{jersey_number}/generate-idp")
+async def generate_player_idp(jersey_number: int, req: IDPRequest):
+    """Generate Individual Development Plan for a player using Claude AI."""
+    from services.player_highlights import player_highlights_service
+    from services.player_clip_analyzer import player_analyzer, ClipMetrics
+    from services.ai_coaching_engine import ai_coaching_engine
+    from dataclasses import asdict
+
+    # Get player data from highlights service
+    player_data = player_highlights_service.players.get(jersey_number)
+    player_name = req.player_name or (player_data.player_name if player_data else f"Player #{jersey_number}")
+    team = req.team
+
+    # Gather clip metrics from analyzer
+    stats = player_analyzer.player_stats.get(player_name)
+    clip_metrics_list = stats.clip_metrics if stats and stats.clip_metrics else []
+
+    # If no analyzed clips yet, try to build basic metrics from highlights
+    if not clip_metrics_list and player_data:
+        basic = ClipMetrics(
+            touches=player_data.touches,
+            passes_attempted=player_data.passes_attempted,
+            passes_completed=player_data.passes_completed,
+            shots=player_data.shots,
+            tackles_attempted=player_data.tackles,
+            interceptions=player_data.interceptions,
+            duration_seconds=sum(
+                (m.frame_end - m.frame_start) / player_highlights_service.fps
+                for m in player_data.moments
+            ),
+        )
+        if basic.passes_attempted > 0:
+            basic.pass_accuracy = round(basic.passes_completed / basic.passes_attempted * 100, 1)
+        clip_metrics_list = [basic]
+
+    idp = await ai_coaching_engine.generate_player_idp(
+        jersey_number=jersey_number,
+        player_name=player_name,
+        team=team,
+        position=req.position,
+        clip_metrics_list=clip_metrics_list,
+    )
+
+    return {
+        "jersey_number": jersey_number,
+        "player_name": player_name,
+        "position": req.position,
+        "overall_rating": idp.overall_rating,
+        "four_corner": asdict(idp.four_corner),
+        "key_strengths": idp.key_strengths,
+        "development_priorities": [asdict(dp) for dp in idp.development_priorities],
+        "weekly_focus": idp.weekly_focus,
+        "session_plan": idp.session_plan,
+        "three_month_goals": idp.three_month_goals,
+        "six_month_goals": idp.six_month_goals,
+        "raw_text": idp.raw_text,
+        "generated_at": idp.generated_at,
+    }
+
+
+@app.get("/api/player/{jersey_number}/idp")
+async def get_player_idp(jersey_number: int):
+    """Get the latest IDP for a player (cached from last generation)."""
+    # For now, return guidance to call generate endpoint
+    return {
+        "jersey_number": jersey_number,
+        "message": "Call POST /api/player/{jersey_number}/generate-idp to generate an IDP",
+    }
+
+
+@app.get("/api/player/{jersey_number}/clips")
+async def get_player_clips_with_metrics(jersey_number: int):
+    """Get all clips for a player with their elite metrics."""
+    from services.player_highlights import player_highlights_service
+    from dataclasses import asdict
+
+    clips = player_highlights_service.get_player_clips(jersey_number)
+    result = []
+    for clip in clips:
+        clip_dict = asdict(clip)
+        result.append(clip_dict)
+
+    return {
+        "jersey_number": jersey_number,
+        "total_clips": len(result),
+        "clips": result,
+    }
+
+
+@app.get("/api/player/{jersey_number}/clips/{clip_id}/feedback")
+async def get_clip_ai_feedback(jersey_number: int, clip_id: str, position: str = "CM"):
+    """Get AI coaching feedback for a specific clip."""
+    from services.player_highlights import player_highlights_service
+    from services.player_clip_analyzer import player_analyzer, ClipMetrics
+    from services.ai_coaching_engine import ai_coaching_engine
+    from dataclasses import asdict
+
+    # Find clip in registry
+    clip_meta = player_highlights_service.clips_registry.get(clip_id)
+    if not clip_meta:
+        raise HTTPException(status_code=404, detail=f"Clip {clip_id} not found")
+
+    # Check for analyzed metrics
+    player_data = player_highlights_service.players.get(jersey_number)
+    player_name = player_data.player_name if player_data else f"Player #{jersey_number}"
+
+    # Build basic clip metrics from clip metadata
+    metrics = ClipMetrics(
+        clip_id=clip_id,
+        clip_path=clip_meta.clip_path,
+        duration_seconds=clip_meta.duration_seconds,
+    )
+
+    feedback = await ai_coaching_engine.analyze_player_clip(
+        clip_metrics=metrics,
+        player_position=position,
+        player_name=player_name,
+    )
+
+    return {
+        "clip_id": clip_id,
+        "jersey_number": jersey_number,
+        "feedback": asdict(feedback),
+    }
+
+
+@app.post("/api/manager/generate-mdp")
+async def generate_manager_mdp(req: MDPRequest):
+    """Generate Manager Development Plan from match tactical data."""
+    from services.ai_coaching_engine import ai_coaching_engine
+    from dataclasses import asdict
+
+    # Gather tactical data from cached analysis
+    tactical_data = {}
+    formation_data = {}
+    event_summary = {}
+
+    # Try to get from analysis cache
+    for match_id, cached in _analysis_cache.items():
+        if req.match_id and match_id != req.match_id:
+            continue
+        analysis = cached.get("result", {})
+        tactical_data = analysis.get("tactical_summary", {})
+        formation_data = analysis.get("formation_stats", {})
+        event_summary = {
+            "total_events": tactical_data.get("total_events", 0),
+            "event_counts": tactical_data.get("event_counts", {}),
+        }
+        break
+
+    # Also gather from tactical intelligence service
+    try:
+        from services.tactical_intelligence import tactical_intelligence_service
+        ti_summary = tactical_intelligence_service.get_tactical_summary()
+        if ti_summary:
+            tactical_data.update(ti_summary)
+    except Exception:
+        pass
+
+    mdp = await ai_coaching_engine.generate_manager_mdp(
+        tactical_data=tactical_data,
+        formation_data=formation_data,
+        event_summary=event_summary,
+    )
+
+    return {
+        "formation_management_score": mdp.formation_management_score,
+        "pressing_strategy_score": mdp.pressing_strategy_score,
+        "transition_score": mdp.transition_score,
+        "tactical_strengths": mdp.tactical_strengths,
+        "tactical_weaknesses": mdp.tactical_weaknesses,
+        "development_priorities": [asdict(dp) for dp in mdp.development_priorities],
+        "coaching_education": mdp.coaching_education,
+        "raw_text": mdp.raw_text,
+        "generated_at": mdp.generated_at,
+    }
+
+
+@app.get("/api/manager/mdp")
+async def get_manager_mdp():
+    """Get the latest MDP (cached from last generation)."""
+    return {
+        "message": "Call POST /api/manager/generate-mdp to generate an MDP",
+    }
+
+
+@app.get("/api/manager/tactical-narrative")
+async def get_tactical_narrative():
+    """Get AI-written tactical analysis narrative."""
+    from services.ai_coaching_engine import ai_coaching_engine
+
+    # Gather intelligence data
+    intelligence_data = {}
+    try:
+        from services.tactical_intelligence import tactical_intelligence_service
+        intelligence_data = tactical_intelligence_service.get_full_analysis()
+    except Exception:
+        pass
+
+    if not intelligence_data:
+        # Fallback to analysis cache
+        for cached in _analysis_cache.values():
+            analysis = cached.get("result", {})
+            intelligence_data = analysis.get("tactical_summary", {})
+            break
+
+    narrative = await ai_coaching_engine.generate_tactical_narrative(intelligence_data)
+
+    return {
+        "narrative": narrative,
+        "ai_powered": ai_coaching_engine.is_available,
+    }
+
+
 # ============== Startup/Shutdown Events ==============
 
 @app.on_event("startup")
@@ -8729,6 +9446,54 @@ async def startup_event():
     print(f"Starting {settings.APP_NAME}...")
     print(f"Cloud inference: {'enabled' if settings.CLOUD_INFERENCE_ENABLED else 'disabled'}")
     print(f"GPU available: {settings.USE_GPU}")
+
+    # Initialize AI Coaching Engine with Claude + OpenAI clients
+    claude_client = None
+    openai_client = None
+
+    if settings.ANTHROPIC_API_KEY:
+        try:
+            import anthropic
+            claude_client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+            print(f"Claude client initialized (model: {settings.AI_COACHING_MODEL})")
+        except Exception as e:
+            print(f"Claude client init failed: {e}")
+
+    if settings.OPENAI_API_KEY:
+        try:
+            import openai
+            openai_client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            print(f"OpenAI client initialized (model: {settings.AI_VISION_MODEL})")
+        except Exception as e:
+            print(f"OpenAI client init failed: {e}")
+
+    ai_coaching_engine.initialize(claude_client=claude_client, openai_client=openai_client)
+
+    # Also wire Claude into coach_assist_service
+    if claude_client:
+        from services.coach_assist import coach_assist_service
+        coach_assist_service.set_ai_client(claude_client, provider="claude")
+
+    # Start stale upload session cleanup task
+    asyncio.create_task(_cleanup_stale_uploads())
+
+
+async def _cleanup_stale_uploads():
+    """Periodically clean up stale upload sessions and their temp files."""
+    while True:
+        await asyncio.sleep(3600)  # Run every hour
+        now = time.time()
+        timeout_s = settings.UPLOAD_SESSION_TIMEOUT_HOURS * 3600
+        stale_ids = [
+            sid for sid, sess in upload_sessions.items()
+            if (now - sess.created_at) > timeout_s
+        ]
+        for sid in stale_ids:
+            temp_dir = settings.UPLOAD_TEMP_DIR / sid
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            del upload_sessions[sid]
+        if stale_ids:
+            print(f"[UPLOAD CLEANUP] Removed {len(stale_ids)} stale upload sessions")
 
 
 @app.on_event("shutdown")

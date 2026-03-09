@@ -158,6 +158,19 @@ class Settings(BaseSettings):
     PREDICTION_REENTRY_THRESHOLD: float = 20.0          # Max distance for re-entry matching (0-100 coords)
     PREDICTION_FRUSTUM_MARGIN: float = 5.0              # Margin added to detected player bounding box (%)
 
+    # Chunked Upload
+    UPLOAD_CHUNK_SIZE_MB: int = 50              # Size per chunk
+    UPLOAD_MAX_FILE_SIZE_MB: int = 20000        # 20GB max (covers 4K VEO)
+    UPLOAD_SESSION_TIMEOUT_HOURS: int = 24      # Stale session cleanup
+    UPLOAD_TEMP_DIR: Path = DATA_DIR / "upload_chunks"
+
+    # URL Import
+    IMPORT_DOWNLOAD_TIMEOUT_S: int = 3600       # 1 hour max download
+
+    # VEO API Integration
+    VEO_API_BASE_URL: str = "https://api.veo.co.uk/api"
+    VEO_API_TOKEN: Optional[str] = None  # User provides their VEO bearer token
+
     # AI Jersey Detection Settings
     AI_JERSEY_DETECTION_ENABLED: bool = True
     AI_JERSEY_PROVIDER: str = "openai"  # "openai" or "claude"
@@ -178,3 +191,4 @@ settings = Settings()
 settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 settings.FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 settings.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+settings.UPLOAD_TEMP_DIR.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,24 @@
+{
+  "name": "Manager Mentor",
+  "short_name": "ManagerMentor",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#059669",
+  "icons": [
+    { "src": "/football.svg", "sizes": "any", "type": "image/svg+xml" }
+  ],
+  "share_target": {
+    "action": "/share-target",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "files": [
+        {
+          "name": "video",
+          "accept": ["video/mp4", "video/quicktime", "video/*"]
+        }
+      ]
+    }
+  }
+}
