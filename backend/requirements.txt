@@ -60,5 +60,8 @@ openai>=1.50.0
 # Auth
 python-jose[cryptography]>=3.3.0
 
+# System
+psutil>=5.9.0
+
 # Development
 python-dotenv>=1.0.0
