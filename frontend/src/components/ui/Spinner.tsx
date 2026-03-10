@@ -15,8 +15,8 @@ const SIZE_MAP = {
 export function Spinner({ size = 'md', label, className }: SpinnerProps) {
   return (
     <div className={cn('flex flex-col items-center justify-center gap-3', className)}>
-      <div className={cn('border-emerald-500 border-t-transparent rounded-full animate-spin', SIZE_MAP[size])} />
-      {label && <p className="text-slate-400 text-sm">{label}</p>}
+      <div className={cn('border-pitch border-t-transparent rounded-full animate-spin', SIZE_MAP[size])} />
+      {label && <p className="text-text-muted text-sm">{label}</p>}
     </div>
   );
 }

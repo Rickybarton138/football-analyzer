@@ -49,9 +49,9 @@ export default function MatchLayout() {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <div className="text-center">
-          <h2 className="text-white text-xl font-semibold mb-2">Match Not Found</h2>
-          <p className="text-slate-400 mb-4">{error || 'Could not load match analysis.'}</p>
-          <Link to="/" className="text-emerald-400 hover:text-emerald-300">Back to Dashboard</Link>
+          <h2 className="text-text-primary text-xl font-semibold mb-2">Match Not Found</h2>
+          <p className="text-text-muted mb-4">{error || 'Could not load match analysis.'}</p>
+          <Link to="/" className="text-pitch hover:text-pitch-deep font-medium">Back to Dashboard</Link>
         </div>
       </div>
     );
@@ -63,24 +63,24 @@ export default function MatchLayout() {
   return (
     <div className="min-h-screen">
       {/* Match Header */}
-      <header className="bg-surface border-b border-slate-700/50">
+      <header className="bg-surface border-b border-border">
         <div className="px-6 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <Link
                 to="/"
-                className="text-slate-400 hover:text-emerald-400 transition-colors"
+                className="text-text-muted hover:text-pitch transition-colors"
               >
                 <ChevronLeft className="w-5 h-5" />
               </Link>
               <div>
-                <h1 className="text-lg font-semibold text-white">{matchTitle}</h1>
-                <p className="text-slate-400 text-xs">{formatDuration(analysis.duration_seconds)} duration</p>
+                <h1 className="text-lg font-semibold text-text-primary">{matchTitle}</h1>
+                <p className="text-text-muted text-xs">{formatDuration(analysis.duration_seconds)} duration</p>
               </div>
             </div>
 
             {/* Period Selector */}
-            <div className="flex items-center gap-1 bg-slate-800/50 rounded-lg p-1">
+            <div className="flex items-center gap-1 bg-surface-alt rounded-lg p-1 border border-border">
               {(['full', '1st', '2nd'] as const).map(period => (
                 <button
                   key={period}
@@ -88,8 +88,8 @@ export default function MatchLayout() {
                   className={cn(
                     'px-3 py-1.5 text-xs font-medium rounded-md transition-all',
                     selectedPeriod === period
-                      ? 'bg-emerald-500 text-white'
-                      : 'text-slate-400 hover:text-white'
+                      ? 'bg-pitch text-white shadow-sm'
+                      : 'text-text-muted hover:text-text-primary'
                   )}
                 >
                   {period === 'full' ? 'Full Match' : `${period} Half`}
@@ -109,8 +109,8 @@ export default function MatchLayout() {
                 className={cn(
                   'px-4 py-2.5 text-sm font-medium transition-all border-b-2 flex items-center gap-2',
                   activeTab === tab.id
-                    ? 'text-emerald-400 border-emerald-400'
-                    : 'text-slate-400 border-transparent hover:text-slate-200'
+                    ? 'text-pitch border-pitch'
+                    : 'text-text-muted border-transparent hover:text-text-primary'
                 )}
               >
                 <tab.icon className="w-4 h-4" />

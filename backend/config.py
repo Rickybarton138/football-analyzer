@@ -3,25 +3,52 @@ Configuration settings for the Football Match Analyzer.
 """
 from pathlib import Path
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import Optional, List
 import os
+
+
+def _resolve_data_dir() -> Path:
+    """Railway uses a persistent volume at /data; local dev uses ./data."""
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        return Path("/data")
+    return Path(__file__).parent.parent / "data"
 
 
 class Settings(BaseSettings):
     """Application settings with environment variable support."""
 
     # Application
-    APP_NAME: str = "Football Match Analyzer"
+    APP_NAME: str = "Manager Mentor"
     DEBUG: bool = True
+
+    # Auth
+    JWT_SECRET_KEY: str = "dev-secret-change-me"
+    ADMIN_PASSWORD: str = "admin"
+
+    # CORS — comma-separated origins; empty = use hardcoded dev list
+    CORS_ORIGINS: str = ""
+
+    @property
+    def cors_origin_list(self) -> List[str]:
+        if self.CORS_ORIGINS:
+            return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+        return [
+            "http://localhost:3000", "http://localhost:3001", "http://localhost:3002",
+            "http://localhost:3003", "http://localhost:5173", "http://localhost:3004",
+            "http://localhost:3005", "http://127.0.0.1:3000", "http://127.0.0.1:3001",
+            "http://127.0.0.1:3002", "http://127.0.0.1:3003", "http://127.0.0.1:3004",
+            "http://127.0.0.1:3005",
+        ]
 
     # Paths
     BASE_DIR: Path = Path(__file__).parent.parent
-    DATA_DIR: Path = BASE_DIR / "data"
+    DATA_DIR: Path = _resolve_data_dir()
     UPLOAD_DIR: Path = DATA_DIR / "uploads"
     FRAMES_DIR: Path = DATA_DIR / "frames"
     MODELS_DIR: Path = DATA_DIR / "models"
 
     # Database
+    DATABASE_PATH: Path = DATA_DIR / "manager_mentor.db"
     DATABASE_URL: str = "sqlite:///./data/football_analyzer.db"
 
     # Video Processing
@@ -163,6 +190,7 @@ class Settings(BaseSettings):
     UPLOAD_MAX_FILE_SIZE_MB: int = 20000        # 20GB max (covers 4K VEO)
     UPLOAD_SESSION_TIMEOUT_HOURS: int = 24      # Stale session cleanup
     UPLOAD_TEMP_DIR: Path = DATA_DIR / "upload_chunks"
+    FRONTEND_DIST_DIR: Path = BASE_DIR / "frontend" / "dist"
 
     # URL Import
     IMPORT_DOWNLOAD_TIMEOUT_S: int = 3600       # 1 hour max download

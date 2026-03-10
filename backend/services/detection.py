@@ -32,6 +32,7 @@ class DetectionService:
         self._cloud_client = None
         self._sv_available = False
         self._team_classifier = None  # SigLIP classifier (lazy init in Step 5)
+        self._sahi_model = None  # Cached SAHI model wrapper
 
         # Detection settings
         self.target_player_count = 22
@@ -188,6 +189,19 @@ class DetectionService:
             if len(retry_dets) > len(detections):
                 print(f"[DETECTION] Retry at conf={retry_conf:.2f}: {len(retry_dets)} players (was {len(detections)})")
                 detections = retry_dets
+
+        # SAHI fallback: if still below threshold, try sliced inference
+        if (settings.SAHI_PLAYER_DETECTION
+                and len(detections) < settings.SAHI_PLAYER_MIN_TRIGGER
+                and self.model is not None):
+            try:
+                sahi_new = await self._detect_sahi_players(frame, detections)
+                if sahi_new:
+                    print(f"[DETECTION] SAHI found {len(sahi_new)} additional players "
+                          f"({len(detections)} -> {len(detections) + len(sahi_new)})")
+                    detections.extend(sahi_new)
+            except Exception as e:
+                print(f"[DETECTION] SAHI fallback failed: {e}")
 
         if len(detections) < self.MIN_EXPECTED_PLAYERS:
             print(f"[DETECTION] Warning: Only detected {len(detections)} players (expected {self.MIN_EXPECTED_PLAYERS}+)")
@@ -369,6 +383,110 @@ class DetectionService:
             return False
 
         return True
+
+    def _get_sahi_model(self):
+        """Get or create cached SAHI model wrapper."""
+        if self._sahi_model is None:
+            from sahi import AutoDetectionModel
+            self._sahi_model = AutoDetectionModel.from_pretrained(
+                model_type="ultralytics",
+                model=self.model,
+                confidence_threshold=settings.SAHI_PLAYER_CONFIDENCE,
+                device="cuda:0" if settings.USE_GPU else "cpu",
+            )
+        return self._sahi_model
+
+    def _overlaps_existing(self, x1, y1, x2, y2, existing_boxes, iou_threshold=0.3) -> bool:
+        """Check if a bbox overlaps any existing detection above IoU threshold."""
+        for ex1, ey1, ex2, ey2 in existing_boxes:
+            ix1 = max(x1, ex1); iy1 = max(y1, ey1)
+            ix2 = min(x2, ex2); iy2 = min(y2, ey2)
+            if ix1 >= ix2 or iy1 >= iy2:
+                continue
+            intersection = (ix2 - ix1) * (iy2 - iy1)
+            area1 = (x2 - x1) * (y2 - y1)
+            area2 = (ex2 - ex1) * (ey2 - ey1)
+            iou = intersection / (area1 + area2 - intersection)
+            if iou > iou_threshold:
+                return True
+        return False
+
+    async def _detect_sahi_players(self, frame: np.ndarray, existing_detections: List[DetectedPlayer]) -> List[DetectedPlayer]:
+        """Run SAHI sliced inference to find small/distant players missed by standard YOLO."""
+        loop = asyncio.get_event_loop()
+
+        def _run_sahi():
+            from sahi.predict import get_sliced_prediction
+            sahi_model = self._get_sahi_model()
+            result = get_sliced_prediction(
+                image=frame,
+                detection_model=sahi_model,
+                slice_height=settings.SAHI_PLAYER_SLICE_SIZE,
+                slice_width=settings.SAHI_PLAYER_SLICE_SIZE,
+                overlap_height_ratio=settings.SAHI_PLAYER_OVERLAP,
+                overlap_width_ratio=settings.SAHI_PLAYER_OVERLAP,
+                verbose=0,
+            )
+            return result
+
+        result = await loop.run_in_executor(None, _run_sahi)
+
+        # Build existing bbox set for IoU dedup
+        existing_boxes = [(d.bbox.x1, d.bbox.y1, d.bbox.x2, d.bbox.y2) for d in existing_detections]
+        is_football_model = "football" in self.model_name
+        height, width = frame.shape[:2]
+        new_players = []
+
+        for pred in result.object_prediction_list:
+            class_id = pred.category.id
+            # Skip balls
+            if is_football_model and class_id == 0:
+                continue
+            if not is_football_model and class_id != settings.PLAYER_CLASS_ID:
+                continue
+
+            conf = pred.score.value
+            bbox = pred.bbox
+            x1, y1 = int(bbox.minx), int(bbox.miny)
+            x2, y2 = int(bbox.maxx), int(bbox.maxy)
+
+            # Clamp + validate
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            if not self._is_valid_player_bbox(x1, y1, x2, y2, width, height):
+                continue
+
+            # Skip if overlaps existing detection (IoU > 0.3)
+            if self._overlaps_existing(x1, y1, x2, y2, existing_boxes, iou_threshold=0.3):
+                continue
+
+            # Determine if goalkeeper/referee from football model classes
+            is_gk = is_football_model and class_id == 1
+            is_referee = is_football_model and class_id == 3
+
+            box_area = (x2 - x1) * (y2 - y1)
+            jersey_color = None
+            if box_area >= settings.DETECTION_MIN_BOX_AREA:
+                player_roi = frame[y1:y2, x1:x2]
+                jersey_color = self._extract_jersey_color(player_roi)
+
+            if is_referee:
+                team = TeamSide.UNKNOWN
+            else:
+                team = self._classify_team(jersey_color)
+
+            player = DetectedPlayer(
+                track_id=-1,
+                bbox=BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2, confidence=conf),
+                pixel_position=PixelPosition(x=(x1 + x2) // 2, y=(y1 + y2) // 2),
+                team=team,
+                jersey_color=jersey_color.tolist() if jersey_color is not None else None,
+                is_goalkeeper=is_gk,
+            )
+            new_players.append(player)
+            existing_boxes.append((x1, y1, x2, y2))
+
+        return new_players
 
     async def classify_teams_siglip(
         self, frame: np.ndarray, detections: List[DetectedPlayer]

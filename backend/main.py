@@ -23,6 +23,12 @@ from pydantic import BaseModel
 import aiofiles
 
 from config import settings
+from database import (
+    init_db, upsert_video, get_video, update_video_status, get_all_videos,
+    video_exists, upsert_match, get_match, get_videos_for_match,
+    upsert_import_job, get_import_job, get_setting, set_setting,
+)
+from auth import LoginRequest, TokenResponse, login, decode_token
 from models.schemas import (
     VideoUploadResponse, ProcessingStatus, MatchState, MatchInfo,
     TeamSetupRequest, CalibrationRequest, FrameDetection, TacticalAlert,
@@ -55,11 +61,50 @@ app = FastAPI(
 # CORS middleware for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002", "http://localhost:3003", "http://localhost:5173", "http://localhost:3004", "http://localhost:3005", "http://127.0.0.1:3000", "http://127.0.0.1:3001", "http://127.0.0.1:3002", "http://127.0.0.1:3003", "http://127.0.0.1:3004", "http://127.0.0.1:3005"],
+    allow_origins=settings.cors_origin_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============== Auth Middleware ==============
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """JWT auth for all /api/* routes except login and public paths."""
+    path = request.url.path
+
+    # Skip auth for: root, login, static files, uploads, websockets, frontend assets
+    if (
+        path == "/"
+        or path == "/api/auth/login"
+        or path.startswith("/static/")
+        or path.startswith("/uploads/")
+        or path.startswith("/ws/")
+        or path.startswith("/assets/")
+        or path.endswith(".js")
+        or path.endswith(".css")
+        or path.endswith(".html")
+        or path.endswith(".ico")
+        or path.endswith(".png")
+        or path.endswith(".svg")
+        or path.endswith(".json")
+        or not path.startswith("/api/")
+    ):
+        return await call_next(request)
+
+    # Require Bearer token for /api/* routes
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse(status_code=401, content={"detail": "Missing auth token"})
+
+    token = auth_header[7:]
+    sub = decode_token(token)
+    if not sub:
+        return JSONResponse(status_code=401, content={"detail": "Invalid or expired token"})
+
+    return await call_next(request)
 
 # Mount static files for video serving
 app.mount("/static", StaticFiles(directory=str(settings.DATA_DIR)), name="static")
@@ -71,13 +116,11 @@ app.mount("/uploads", StaticFiles(directory=str(settings.UPLOAD_DIR)), name="upl
 # Active WebSocket connections
 active_connections: Dict[str, List[WebSocket]] = {}
 
-# Processing jobs status
-processing_jobs: Dict[str, ProcessingStatus] = {}
+# In-memory overlay for active processing progress (high-frequency updates)
+# Written to DB at status change milestones; cleared on complete/fail
+_active_jobs: Dict[str, ProcessingStatus] = {}
 
-# Match metadata from upload form (team names, colors, formations)
-match_metadata_store: Dict[str, Dict] = {}
-
-# Active match states
+# Active match states (live sessions only — ephemeral)
 match_states: Dict[str, MatchState] = {}
 
 # Service instances (lazy loaded)
@@ -85,6 +128,10 @@ _services: Dict[str, any] = {}
 
 # Analysis cache to avoid reprocessing on every request
 _analysis_cache: Dict[str, Dict] = {}
+
+# Legacy video/analysis paths (replaces 20 hardcoded Windows paths)
+_LEGACY_VIDEO = settings.UPLOAD_DIR / "balti-away-30min.mp4"
+_LEGACY_ANALYSIS = settings.UPLOAD_DIR / "balti-away-30min_analysis.json"
 
 # Chunked upload sessions
 @dataclass
@@ -101,15 +148,6 @@ class UploadSession:
     metadata: Optional[dict] = None    # Match metadata from form
 
 upload_sessions: Dict[str, UploadSession] = {}
-
-# Match half linkage: match_id -> {"first": video_id, "second": video_id}
-match_halves_store: Dict[str, Dict[str, str]] = {}
-
-# URL import jobs: import_id -> {status, progress_pct, video_id, error}
-import_jobs: Dict[str, dict] = {}
-
-# VEO API token (stored in memory after connect)
-veo_api_token: Optional[str] = settings.VEO_API_TOKEN
 
 
 def _populate_visualization_from_analysis(analysis_result: Dict):
@@ -286,11 +324,24 @@ manager = ConnectionManager()
 @app.get("/")
 async def root():
     """Health check endpoint."""
+    # In production, serve the SPA index.html
+    index = settings.FRONTEND_DIST_DIR / "index.html"
+    if index.exists():
+        return FileResponse(str(index), media_type="text/html")
     return {
         "status": "healthy",
         "app": settings.APP_NAME,
         "version": "1.0.0"
     }
+
+
+@app.post("/api/auth/login")
+async def auth_login(req: LoginRequest):
+    """Authenticate with admin password and receive JWT."""
+    token = login(req.password)
+    if not token:
+        raise HTTPException(status_code=401, detail="Invalid password")
+    return TokenResponse(access_token=token)
 
 
 @app.get("/api/status")
@@ -370,7 +421,7 @@ async def get_status():
         "recommended_mode": recommended_mode,
         "recommendation": recommendation,
         "active_matches": len(match_states),
-        "processing_jobs": len(processing_jobs)
+        "processing_jobs": len(_active_jobs)
     }
 
 
@@ -415,13 +466,18 @@ async def upload_video(
 
     # Store match metadata for use during processing
     if match_metadata:
-        match_metadata_store[video_id] = match_metadata
+        match_id = match_metadata.get("match_id", video_id)
+        await upsert_match(match_id, metadata=match_metadata)
 
-    # Initialize processing status
-    processing_jobs[video_id] = ProcessingStatus(
-        video_id=video_id,
+    # Persist video to DB
+    await upsert_video(
+        video_id,
+        filename=file.filename,
         status="uploaded",
-        total_frames=video_meta.get("total_frames", 0)
+        total_frames=video_meta.get("total_frames", 0),
+        duration_ms=video_meta.get("duration_ms", 0),
+        fps=video_meta.get("fps", 0),
+        resolution=f"{video_meta.get('width', 0)}x{video_meta.get('height', 0)}",
     )
 
     return VideoUploadResponse(
@@ -590,19 +646,20 @@ async def chunked_upload_complete(upload_id: str):
 
     # Store match metadata if provided
     if session.metadata:
-        match_metadata_store[video_id] = session.metadata
+        match_id = session.match_id or video_id
+        await upsert_match(match_id, metadata=session.metadata)
 
-    # Link halves by match_id
-    if session.match_half in ("first", "second") and session.match_id:
-        if session.match_id not in match_halves_store:
-            match_halves_store[session.match_id] = {}
-        match_halves_store[session.match_id][session.match_half] = video_id
-
-    # Initialize processing status
-    processing_jobs[video_id] = ProcessingStatus(
-        video_id=video_id,
+    # Persist video to DB (links halves via match_id + match_half columns)
+    await upsert_video(
+        video_id,
+        filename=session.filename,
         status="uploaded",
-        total_frames=video_meta.get("total_frames", 0)
+        total_frames=video_meta.get("total_frames", 0),
+        match_id=session.match_id if session.match_half in ("first", "second") else None,
+        match_half=session.match_half if session.match_half in ("first", "second") else None,
+        duration_ms=video_meta.get("duration_ms", 0),
+        fps=video_meta.get("fps", 0),
+        resolution=f"{video_meta.get('width', 0)}x{video_meta.get('height', 0)}",
     )
 
     # Clean up session
@@ -621,19 +678,20 @@ async def chunked_upload_complete(upload_id: str):
 @app.get("/api/match/{match_id}/halves")
 async def get_match_halves(match_id: str):
     """Get linked video IDs for a match uploaded in halves."""
-    halves = match_halves_store.get(match_id)
+    halves = await get_videos_for_match(match_id)
     if not halves:
         raise HTTPException(404, "No halves found for this match")
 
     result = {"match_id": match_id}
     for half_key in ("first", "second"):
-        vid = halves.get(half_key)
-        if vid:
-            status = processing_jobs.get(vid)
+        vid_data = halves.get(half_key)
+        if vid_data:
+            # Check in-memory overlay first for active jobs
+            active = _active_jobs.get(vid_data["video_id"])
             result[half_key] = {
-                "video_id": vid,
-                "status": status.status if status else "unknown",
-                "progress_pct": status.progress_pct if status else 0,
+                "video_id": vid_data["video_id"],
+                "status": active.status if active else vid_data.get("status", "unknown"),
+                "progress_pct": active.progress_pct if active else vid_data.get("progress_pct", 0),
             }
     return result
 
@@ -686,15 +744,15 @@ async def _download_video_from_url(import_id: str, url: str, metadata: Optional[
         video_id = str(uuid.uuid4())
         video_path = settings.UPLOAD_DIR / f"{video_id}{ext}"
 
-        import_jobs[import_id]["status"] = "downloading"
+        await upsert_import_job(import_id, status="downloading")
 
         async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(
             settings.IMPORT_DOWNLOAD_TIMEOUT_S, connect=30.0
         )) as client:
             async with client.stream("GET", direct_url) as response:
                 if response.status_code >= 400:
-                    import_jobs[import_id] = {"status": "failed", "progress_pct": 0, "video_id": None,
-                                              "error": f"Download failed: HTTP {response.status_code}"}
+                    await upsert_import_job(import_id, status="failed",
+                                            error=f"Download failed: HTTP {response.status_code}")
                     return
 
                 total = int(response.headers.get("content-length", 0))
@@ -705,51 +763,50 @@ async def _download_video_from_url(import_id: str, url: str, metadata: Optional[
                         await f.write(chunk)
                         downloaded += len(chunk)
                         if total > 0:
-                            import_jobs[import_id]["progress_pct"] = round((downloaded / total) * 90)
+                            pct = round((downloaded / total) * 90)
                         else:
-                            import_jobs[import_id]["progress_pct"] = min(80, downloaded // (1024 * 1024))
+                            pct = min(80, downloaded // (1024 * 1024))
+                        await upsert_import_job(import_id, status="downloading", progress_pct=pct)
 
         # Extract metadata
-        import_jobs[import_id]["status"] = "processing_metadata"
-        import_jobs[import_id]["progress_pct"] = 92
+        await upsert_import_job(import_id, status="processing_metadata", progress_pct=92)
 
         services = get_services()
         vid_metadata = await services["video"].get_video_metadata(video_path)
 
-        # Store in match_metadata_store
+        # Store match metadata
         if metadata:
-            match_metadata_store[video_id] = metadata
+            m_id = match_id or video_id
+            await upsert_match(m_id, metadata=metadata)
 
-        # Link halves if applicable
-        if match_id and match_half in ("first", "second"):
-            if match_id not in match_halves_store:
-                match_halves_store[match_id] = {}
-            match_halves_store[match_id][match_half] = video_id
-
-        # Initialize processing status
-        processing_jobs[video_id] = ProcessingStatus(
-            video_id=video_id,
+        # Persist video to DB
+        await upsert_video(
+            video_id,
+            filename=suggested_filename,
             status="uploaded",
-            total_frames=vid_metadata.get("total_frames", 0)
+            total_frames=vid_metadata.get("total_frames", 0),
+            match_id=match_id if match_half in ("first", "second") else None,
+            match_half=match_half if match_half in ("first", "second") else None,
+            duration_ms=vid_metadata.get("duration_ms", 0),
+            fps=vid_metadata.get("fps", 0),
+            resolution=f"{vid_metadata.get('width', 0)}x{vid_metadata.get('height', 0)}",
         )
 
-        import_jobs[import_id] = {
-            "status": "ready",
-            "progress_pct": 100,
-            "video_id": video_id,
-            "error": None,
-            "filename": suggested_filename,
-            "duration_ms": vid_metadata.get("duration_ms", 0),
-            "fps": vid_metadata.get("fps", 0),
-            "resolution": [vid_metadata.get("width", 0), vid_metadata.get("height", 0)],
-        }
+        await upsert_import_job(
+            import_id, status="ready", progress_pct=100, video_id=video_id,
+            extra={
+                "filename": suggested_filename,
+                "duration_ms": vid_metadata.get("duration_ms", 0),
+                "fps": vid_metadata.get("fps", 0),
+                "resolution": [vid_metadata.get("width", 0), vid_metadata.get("height", 0)],
+            },
+        )
 
     except Exception as e:
         # Clean up partial file
         if 'video_path' in dir() and video_path.exists():
             video_path.unlink(missing_ok=True)
-        import_jobs[import_id] = {"status": "failed", "progress_pct": 0, "video_id": None,
-                                  "error": str(e)}
+        await upsert_import_job(import_id, status="failed", error=str(e))
 
 
 @app.post("/api/video/import")
@@ -762,7 +819,7 @@ async def import_video_from_url(req: VideoImportRequest, background_tasks: Backg
         raise HTTPException(400, "Invalid URL. Must start with http:// or https://")
 
     import_id = str(uuid.uuid4())
-    import_jobs[import_id] = {"status": "downloading", "progress_pct": 0, "video_id": None, "error": None}
+    await upsert_import_job(import_id, url=url, status="downloading")
 
     background_tasks.add_task(
         _download_video_from_url, import_id, url, req.metadata, req.match_half, req.match_id
@@ -774,9 +831,14 @@ async def import_video_from_url(req: VideoImportRequest, background_tasks: Backg
 @app.get("/api/video/import/{import_id}/status")
 async def get_import_status(import_id: str):
     """Poll the status of a URL import job."""
-    job = import_jobs.get(import_id)
+    job = await get_import_job(import_id)
     if not job:
         raise HTTPException(404, "Import job not found")
+    # Flatten extra fields for backward compat
+    if job.get("extra") and isinstance(job["extra"], dict):
+        job.update(job.pop("extra"))
+    else:
+        job.pop("extra", None)
     return job
 
 
@@ -790,7 +852,6 @@ class VeoConnectRequest(BaseModel):
 async def veo_connect(req: VeoConnectRequest):
     """Validate VEO API token and store it."""
     import httpx
-    global veo_api_token
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -804,7 +865,7 @@ async def veo_connect(req: VeoConnectRequest):
                 raise HTTPException(resp.status_code, f"VEO API error: {resp.status_code}")
 
             user_info = resp.json()
-            veo_api_token = req.token
+            await set_setting("veo_api_token", req.token)
             return {"connected": True, "user_info": user_info}
     except httpx.RequestError as e:
         raise HTTPException(502, f"Cannot reach VEO API: {str(e)}")
@@ -813,7 +874,8 @@ async def veo_connect(req: VeoConnectRequest):
 @app.get("/api/veo/status")
 async def veo_status():
     """Check if VEO is connected."""
-    return {"connected": veo_api_token is not None}
+    token = await get_setting("veo_api_token")
+    return {"connected": token is not None}
 
 
 @app.get("/api/veo/recordings")
@@ -821,7 +883,8 @@ async def veo_recordings(page: int = 1, per_page: int = 20):
     """List recordings from connected VEO account."""
     import httpx
 
-    if not veo_api_token:
+    token = await get_setting("veo_api_token")
+    if not token:
         raise HTTPException(401, "VEO not connected. Call POST /api/veo/connect first.")
 
     try:
@@ -829,7 +892,7 @@ async def veo_recordings(page: int = 1, per_page: int = 20):
             resp = await client.get(
                 f"{settings.VEO_API_BASE_URL}/videos",
                 params={"page": page, "per_page": per_page},
-                headers={"Authorization": f"Bearer {veo_api_token}"}
+                headers={"Authorization": f"Bearer {token}"}
             )
             if resp.status_code == 401:
                 raise HTTPException(401, "VEO token expired. Please reconnect.")
@@ -858,7 +921,8 @@ async def veo_import_recording(recording_id: str, background_tasks: BackgroundTa
     """Import a specific VEO recording by ID."""
     import httpx
 
-    if not veo_api_token:
+    token = await get_setting("veo_api_token")
+    if not token:
         raise HTTPException(401, "VEO not connected. Call POST /api/veo/connect first.")
 
     try:
@@ -866,7 +930,7 @@ async def veo_import_recording(recording_id: str, background_tasks: BackgroundTa
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(
                 f"{settings.VEO_API_BASE_URL}/videos/{recording_id}",
-                headers={"Authorization": f"Bearer {veo_api_token}"}
+                headers={"Authorization": f"Bearer {token}"}
             )
             if resp.status_code >= 400:
                 raise HTTPException(resp.status_code, f"VEO API error: {resp.status_code}")
@@ -878,7 +942,7 @@ async def veo_import_recording(recording_id: str, background_tasks: BackgroundTa
 
         # Reuse URL import pipeline
         import_id = str(uuid.uuid4())
-        import_jobs[import_id] = {"status": "downloading", "progress_pct": 0, "video_id": None, "error": None}
+        await upsert_import_job(import_id, url=download_url, status="downloading")
 
         background_tasks.add_task(
             _download_video_from_url, import_id, download_url,
@@ -912,11 +976,15 @@ async def register_existing_video(video_id: str, filename: str = "video.mp4"):
     services = get_services()
     metadata = await services["video"].get_video_metadata(video_path)
 
-    # Initialize processing status
-    processing_jobs[video_id] = ProcessingStatus(
-        video_id=video_id,
+    # Persist video to DB
+    await upsert_video(
+        video_id,
+        filename=filename,
         status="uploaded",
-        total_frames=metadata.get("total_frames", 0)
+        total_frames=metadata.get("total_frames", 0),
+        duration_ms=metadata.get("duration_ms", 0),
+        fps=metadata.get("fps", 0),
+        resolution=f"{metadata.get('width', 0)}x{metadata.get('height', 0)}",
     )
 
     return VideoUploadResponse(
@@ -950,11 +1018,11 @@ async def start_processing(
             - quick_overview: Fast summary with key stats only
         my_team: Which team is yours (home or away)
     """
-    if video_id not in processing_jobs:
+    if not await video_exists(video_id):
         raise HTTPException(status_code=404, detail="Video not found")
 
     # Update status
-    processing_jobs[video_id].status = "queued"
+    await update_video_status(video_id, status="queued")
     print(f"[PROCESS] Starting background task for video {video_id}")
 
     # Start background processing with analysis mode
@@ -985,8 +1053,11 @@ async def process_video(
     """
     print(f"[PROCESS] Background task started for video {video_id}")
     services = get_services()
-    job = processing_jobs[video_id]
-    job.status = "processing"
+    vid_row = await get_video(video_id)
+    total_frames = vid_row["total_frames"] if vid_row else 0
+    job = ProcessingStatus(video_id=video_id, status="processing", total_frames=total_frames)
+    _active_jobs[video_id] = job
+    await update_video_status(video_id, status="processing")
     print(f"[PROCESS] Status set to 'processing', total_frames={job.total_frames}")
 
     # Initialize detection model if not already loaded
@@ -1386,11 +1457,15 @@ async def process_video(
 
         job.status = "completed"
         job.progress_pct = 100
+        await update_video_status(video_id, status="completed", progress_pct=100)
+        _active_jobs.pop(video_id, None)
 
     except Exception as e:
         import traceback
         job.status = "failed"
         job.error_message = str(e)
+        await update_video_status(video_id, status="failed", error_message=str(e))
+        _active_jobs.pop(video_id, None)
         print(f"Processing error: {e}")
         traceback.print_exc()
 
@@ -1398,28 +1473,51 @@ async def process_video(
 @app.get("/api/video/{video_id}/status", response_model=ProcessingStatus)
 async def get_processing_status(video_id: str):
     """Get processing status for a video."""
-    if video_id not in processing_jobs:
+    # Check in-memory overlay first (active processing)
+    if video_id in _active_jobs:
+        return _active_jobs[video_id]
+    # Fall back to DB
+    vid = await get_video(video_id)
+    if not vid:
         raise HTTPException(status_code=404, detail="Video not found")
-    return processing_jobs[video_id]
+    return ProcessingStatus(
+        video_id=vid["video_id"],
+        status=vid["status"],
+        progress_pct=vid["progress_pct"],
+        current_frame=vid["current_frame"],
+        total_frames=vid["total_frames"],
+        error_message=vid.get("error_message"),
+    )
 
 
 @app.get("/api/jobs")
 async def list_all_jobs():
     """Debug endpoint: List all processing jobs with their status."""
-    return {
-        "total": len(processing_jobs),
-        "jobs": [
-            {
-                "video_id": job.video_id,
-                "status": job.status,
-                "progress_pct": job.progress_pct,
-                "current_frame": job.current_frame,
-                "total_frames": job.total_frames,
-                "error_message": job.error_message
-            }
-            for job in processing_jobs.values()
-        ]
-    }
+    all_vids = await get_all_videos()
+    # Overlay active jobs
+    jobs = []
+    seen = set()
+    for vid_id, job in _active_jobs.items():
+        jobs.append({
+            "video_id": job.video_id,
+            "status": job.status,
+            "progress_pct": job.progress_pct,
+            "current_frame": job.current_frame,
+            "total_frames": job.total_frames,
+            "error_message": job.error_message,
+        })
+        seen.add(vid_id)
+    for v in all_vids:
+        if v["video_id"] not in seen:
+            jobs.append({
+                "video_id": v["video_id"],
+                "status": v["status"],
+                "progress_pct": v["progress_pct"],
+                "current_frame": v["current_frame"],
+                "total_frames": v["total_frames"],
+                "error_message": v.get("error_message"),
+            })
+    return {"total": len(jobs), "jobs": jobs}
 
 
 @app.get("/api/video/{video_id}/frame/{frame_number}")
@@ -3108,7 +3206,7 @@ from services.vision_ai import vision_ai_service
 async def get_extraction_status():
     """Check video extraction status."""
     import os
-    clip_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min.mp4"
+    clip_path = str(_LEGACY_VIDEO)
 
     if os.path.exists(clip_path):
         size_mb = os.path.getsize(clip_path) / (1024 * 1024)
@@ -3126,7 +3224,7 @@ async def get_extraction_status():
 
 @app.post("/api/video/process-local")
 async def process_video_local(
-    video_path: str = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min.mp4",
+    video_path: str = str(_LEGACY_VIDEO),
     fps: int = 5
 ):
     """
@@ -3248,14 +3346,9 @@ async def reprocess_video(
     }
 
     # Create/update processing job
-    if video_id not in processing_jobs:
-        processing_jobs[video_id] = ProcessingStatus(
-            video_id=video_id,
-            status="reprocessing",
-            total_frames=0
-        )
-    else:
-        processing_jobs[video_id].status = "reprocessing"
+    job = ProcessingStatus(video_id=video_id, status="reprocessing", total_frames=0)
+    _active_jobs[video_id] = job
+    await upsert_video(video_id, status="reprocessing")
 
     # Start reprocessing in background
     background_tasks.add_task(
@@ -3294,7 +3387,7 @@ async def reprocess_video_task(
     print(f"[REPROCESS] Settings: {settings_dict}")
 
     services = get_services()
-    job = processing_jobs.get(video_id)
+    job = _active_jobs.get(video_id)
 
     try:
         # Initialize detection model if needed
@@ -3430,6 +3523,8 @@ async def reprocess_video_task(
         if job:
             job.status = "complete"
             job.progress_pct = 100
+        await update_video_status(video_id, status="completed", progress_pct=100)
+        _active_jobs.pop(video_id, None)
 
     except Exception as e:
         import traceback
@@ -3438,6 +3533,8 @@ async def reprocess_video_task(
         if job:
             job.status = "failed"
             job.error_message = str(e)
+        await update_video_status(video_id, status="failed", error_message=str(e))
+        _active_jobs.pop(video_id, None)
 
 
 @app.get("/api/video/stream")
@@ -3475,7 +3572,7 @@ async def stream_video(video_id: Optional[str] = None):
                 )
 
     # Fall back to old hardcoded video
-    video_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min.mp4"
+    video_path = str(_LEGACY_VIDEO)
     if os.path.exists(video_path):
         print(f"[STREAM] Serving fallback video: {video_path}")
         return FileResponse(
@@ -3515,7 +3612,7 @@ async def get_video_info(video_id: Optional[str] = None):
 
     # Fall back to old hardcoded video
     if not video_path:
-        video_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min.mp4"
+        video_path = str(_LEGACY_VIDEO)
 
     if not os.path.exists(video_path):
         raise HTTPException(status_code=404, detail="Video file not found")
@@ -3552,7 +3649,7 @@ async def get_full_analysis(video_id: Optional[str] = None):
             print(f"[ANALYSIS] Using most recent detection file: {json_path}")
         else:
             # Fall back to old analysis file
-            json_path = Path("C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json")
+            json_path = Path(str(_LEGACY_ANALYSIS))
             print(f"[ANALYSIS] Using fallback analysis file: {json_path}")
 
     if os.path.exists(json_path):
@@ -4080,7 +4177,7 @@ async def get_analysis_result():
         analysis = local_processor.current_analysis
     else:
         # Try to load from saved JSON file
-        json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+        json_path = str(_LEGACY_ANALYSIS)
         if os.path.exists(json_path):
             try:
                 with open(json_path, 'r') as f:
@@ -4141,7 +4238,7 @@ async def get_pass_analysis():
     import json
     import os
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
@@ -4174,7 +4271,7 @@ async def get_formation_analysis():
     import json
     import os
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
@@ -4210,7 +4307,7 @@ async def get_tactical_events():
     import json
     import os
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
@@ -4241,7 +4338,7 @@ async def get_full_analytics():
     import json
     import os
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
@@ -4400,7 +4497,7 @@ async def get_predictive_tracking():
     import json
     import os
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
@@ -4502,7 +4599,7 @@ async def get_out_of_frame_players():
     import json
     import os
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
@@ -4581,7 +4678,7 @@ async def get_player_trajectories(frames_ahead: int = 15):
     import json
     import os
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
@@ -4628,7 +4725,7 @@ async def get_single_player_tracking(track_id: int, frames_ahead: int = 30):
     import json
     import os
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
@@ -4704,7 +4801,7 @@ def _get_cached_or_reanalyze():
         return True
 
     # Slow path: load from JSON and re-analyze (backwards compat)
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
@@ -5218,7 +5315,7 @@ async def generate_pdf_report():
     import os
     from datetime import datetime
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
@@ -5247,7 +5344,7 @@ async def generate_pdf_report():
 
         # Generate HTML report
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_path = f"C:/Users/info/football-analyzer/backend/uploads/match_report_{timestamp}.html"
+        output_path = str(settings.UPLOAD_DIR / f"match_report_{timestamp}.html")
 
         pdf_report_generator.generate_html_report(
             match_info=match_info,
@@ -5275,7 +5372,7 @@ async def download_report(timestamp: str):
     """Download a generated report."""
     import os
 
-    report_path = f"C:/Users/info/football-analyzer/backend/uploads/match_report_{timestamp}.html"
+    report_path = str(settings.UPLOAD_DIR / f"match_report_{timestamp}.html")
 
     if not os.path.exists(report_path):
         raise HTTPException(status_code=404, detail="Report not found")
@@ -5295,7 +5392,7 @@ async def get_report_json():
     import json
     import os
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found")
 
@@ -8657,7 +8754,7 @@ async def get_full_coaching_report():
     import os
     from datetime import datetime
 
-    json_path = "C:/Users/info/football-analyzer/backend/uploads/balti-away-30min_analysis.json"
+    json_path = str(_LEGACY_ANALYSIS)
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Analysis file not found. Please process a video first.")
 
@@ -9443,6 +9540,7 @@ async def get_tactical_narrative():
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup."""
+    await init_db()
     print(f"Starting {settings.APP_NAME}...")
     print(f"Cloud inference: {'enabled' if settings.CLOUD_INFERENCE_ENABLED else 'disabled'}")
     print(f"GPU available: {settings.USE_GPU}")
@@ -9500,6 +9598,28 @@ async def _cleanup_stale_uploads():
 async def shutdown_event():
     """Cleanup on shutdown."""
     print("Shutting down...")
+
+
+# ============== SPA Catch-All (must be last) ==============
+
+# Mount frontend static assets if the dist directory exists
+_fe_assets = settings.FRONTEND_DIST_DIR / "assets"
+if _fe_assets.exists():
+    app.mount("/assets", StaticFiles(directory=str(_fe_assets)), name="frontend-assets")
+
+
+@app.get("/{path:path}")
+async def spa_catch_all(path: str):
+    """Serve the frontend SPA for any non-API route."""
+    # Try to serve a static file first
+    static_file = settings.FRONTEND_DIST_DIR / path
+    if static_file.exists() and static_file.is_file():
+        return FileResponse(str(static_file))
+    # Otherwise serve index.html for SPA routing
+    index = settings.FRONTEND_DIST_DIR / "index.html"
+    if index.exists():
+        return FileResponse(str(index), media_type="text/html")
+    raise HTTPException(404, "Not found")
 
 
 if __name__ == "__main__":

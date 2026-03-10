@@ -4,6 +4,9 @@ Player Highlights Generator Service
 Generates individual highlight videos for each identified player based on
 their jersey number. Tracks events and involvement throughout the match
 and compiles clips into per-player highlight reels.
+
+Uses ffmpeg for fast H.264 clip extraction (10-50x faster than OpenCV),
+with OpenCV fallback if ffmpeg is unavailable.
 """
 import cv2
 import numpy as np
@@ -14,10 +17,39 @@ from datetime import datetime
 import json
 import os
 import uuid
+import shutil
+import subprocess
+import tempfile
+import logging
 
 from models.schemas import (
     DetectedPlayer, MatchEvent, EventType, TeamSide, Position
 )
+
+logger = logging.getLogger(__name__)
+
+# Check ffmpeg availability once at import
+_FFMPEG_AVAILABLE: Optional[bool] = None
+
+
+def _check_ffmpeg_available() -> bool:
+    """Check if ffmpeg binary is available on the system."""
+    global _FFMPEG_AVAILABLE
+    if _FFMPEG_AVAILABLE is not None:
+        return _FFMPEG_AVAILABLE
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True, timeout=5
+        )
+        _FFMPEG_AVAILABLE = result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        _FFMPEG_AVAILABLE = False
+    if _FFMPEG_AVAILABLE:
+        logger.info("ffmpeg detected — using fast H.264 extraction")
+    else:
+        logger.warning("ffmpeg not found — falling back to OpenCV extraction")
+    return _FFMPEG_AVAILABLE
 
 
 @dataclass
@@ -480,43 +512,181 @@ class PlayerHighlightsService:
                 f"{safe_name}_#{jersey_number}_{timestamp}.mp4"
             )
 
-        # Open source video
+        # Try ffmpeg concat approach first
+        if _check_ffmpeg_available():
+            try:
+                return self._generate_highlight_ffmpeg(
+                    selected_moments, output_path, jersey_number, total_duration
+                )
+            except Exception as e:
+                logger.warning(f"ffmpeg highlight generation failed, falling back to OpenCV: {e}")
+
+        # OpenCV fallback
+        return self._generate_highlight_opencv(
+            selected_moments, output_path, jersey_number, total_duration
+        )
+
+    def _generate_highlight_ffmpeg(
+        self,
+        selected_moments: List[Tuple],
+        output_path: str,
+        jersey_number: int,
+        total_duration: float
+    ) -> Optional[str]:
+        """Generate highlight reel using ffmpeg concat demuxer."""
+        import ffmpeg
+
+        tmp_dir = tempfile.mkdtemp(prefix="highlight_")
+        try:
+            clip_paths = []
+            # Extract each segment as a temporary clip
+            for i, (start_frame, end_frame, moment) in enumerate(selected_moments):
+                start_sec = start_frame / self.fps
+                duration = (end_frame - start_frame) / self.fps
+                tmp_clip = os.path.join(tmp_dir, f"seg_{i:03d}.mp4")
+
+                (
+                    ffmpeg
+                    .input(self.video_path, ss=start_sec, t=duration)
+                    .output(
+                        tmp_clip,
+                        vcodec='libx264', acodec='aac',
+                        preset='fast', crf=23,
+                        movflags='+faststart',
+                    )
+                    .overwrite_output()
+                    .run(quiet=True)
+                )
+                clip_paths.append(tmp_clip)
+
+            if not clip_paths:
+                return None
+
+            # Build concat file list
+            concat_file = os.path.join(tmp_dir, "concat.txt")
+            with open(concat_file, 'w') as f:
+                for cp in clip_paths:
+                    f.write(f"file '{cp}'\n")
+
+            # Concatenate via ffmpeg concat demuxer
+            os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+            (
+                ffmpeg
+                .input(concat_file, format='concat', safe=0)
+                .output(output_path, c='copy', movflags='+faststart')
+                .overwrite_output()
+                .run(quiet=True)
+            )
+
+            logger.info(
+                f"Generated highlights for #{jersey_number}: {output_path} "
+                f"({len(clip_paths)} clips, {total_duration:.1f}s)"
+            )
+            return output_path
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _generate_highlight_opencv(
+        self,
+        selected_moments: List[Tuple],
+        output_path: str,
+        jersey_number: int,
+        total_duration: float
+    ) -> Optional[str]:
+        """Generate highlight reel using OpenCV (fallback)."""
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
-            print(f"Could not open video: {self.video_path}")
+            logger.error(f"Could not open video: {self.video_path}")
             return None
 
-        # Create video writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         out = cv2.VideoWriter(
-            output_path,
-            fourcc,
-            self.fps,
+            output_path, fourcc, self.fps,
             (self.frame_width, self.frame_height)
         )
 
-        # Write selected clips
         for start_frame, end_frame, moment in selected_moments:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
             for frame_idx in range(start_frame, end_frame):
                 ret, frame = cap.read()
                 if not ret:
                     break
-
-                # Optionally add overlay showing event type
                 if moment.event_type:
                     self._add_overlay(frame, moment, frame_idx)
-
                 out.write(frame)
 
         cap.release()
         out.release()
 
-        print(f"Generated highlights for #{jersey_number}: {output_path}")
-        print(f"  - {len(selected_moments)} clips, {total_duration:.1f}s total")
-
+        logger.info(
+            f"Generated highlights (OpenCV) for #{jersey_number}: {output_path} "
+            f"({len(selected_moments)} clips, {total_duration:.1f}s)"
+        )
         return output_path
+
+    def _extract_clip_ffmpeg(
+        self,
+        video_path: str,
+        clip_path: str,
+        start_sec: float,
+        duration: float
+    ) -> bool:
+        """Extract a clip using ffmpeg — fast H.264 output, browser-compatible."""
+        try:
+            import ffmpeg
+            os.makedirs(os.path.dirname(clip_path) or '.', exist_ok=True)
+            (
+                ffmpeg
+                .input(video_path, ss=start_sec, t=duration)
+                .output(
+                    clip_path,
+                    vcodec='libx264', acodec='aac',
+                    preset='fast', crf=23,
+                    movflags='+faststart',
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
+            return os.path.exists(clip_path)
+        except Exception as e:
+            logger.warning(f"ffmpeg clip extraction failed: {e}")
+            return False
+
+    def _extract_clip_opencv(
+        self,
+        video_path: str,
+        clip_path: str,
+        start_frame: int,
+        end_frame: int
+    ) -> bool:
+        """Extract a clip using OpenCV (fallback)."""
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                logger.error(f"Could not open video: {video_path}")
+                return False
+
+            os.makedirs(os.path.dirname(clip_path) or '.', exist_ok=True)
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(
+                clip_path, fourcc, self.fps,
+                (self.frame_width, self.frame_height)
+            )
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            for _ in range(start_frame, end_frame):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                out.write(frame)
+
+            cap.release()
+            out.release()
+            return os.path.exists(clip_path)
+        except Exception as e:
+            logger.error(f"OpenCV clip extraction failed: {e}")
+            return False
 
     def _add_overlay(
         self,
@@ -634,30 +804,22 @@ class PlayerHighlightsService:
         clip_filename = f"{event_type}_{mins:02d}m{secs:02d}s_{clip_id}.mp4"
         clip_path = os.path.join(player_clips_dir, clip_filename)
 
-        # Extract the clip
-        cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
-            print(f"Could not open video: {self.video_path}")
+        # Extract the clip — ffmpeg first, OpenCV fallback
+        extraction_ok = False
+        if _check_ffmpeg_available():
+            extraction_ok = self._extract_clip_ffmpeg(
+                self.video_path, clip_path,
+                start_frame / self.fps,
+                (end_frame - start_frame) / self.fps
+            )
+
+        if not extraction_ok:
+            extraction_ok = self._extract_clip_opencv(
+                self.video_path, clip_path, start_frame, end_frame
+            )
+
+        if not extraction_ok:
             return None
-
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(
-            clip_path,
-            fourcc,
-            self.fps,
-            (self.frame_width, self.frame_height)
-        )
-
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
-        for frame_idx in range(start_frame, end_frame):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            out.write(frame)
-
-        cap.release()
-        out.release()
 
         # Calculate duration
         duration_seconds = (end_frame - start_frame) / self.fps

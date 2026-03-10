@@ -23,8 +23,8 @@ export function Tabs({ tabs, activeTab, onChange, className }: TabsProps) {
           className={cn(
             'px-4 py-2.5 text-sm font-medium transition-all border-b-2 flex items-center gap-2',
             activeTab === tab.id
-              ? 'text-emerald-400 border-emerald-400'
-              : 'text-slate-400 border-transparent hover:text-slate-200'
+              ? 'text-pitch border-pitch'
+              : 'text-text-muted border-transparent hover:text-text-primary'
           )}
         >
           {tab.icon}

@@ -1,36 +1,35 @@
-export const APP_NAME = 'DugoutIQ';
+export const APP_NAME = 'CoachMentor';
+export const APP_MODULE = 'Match Analysis';
 export const APP_TAGLINE = 'AI Coaching Intelligence';
 
 export const BRAND = {
-  primary: '#10B981',    // Emerald — the pitch
-  accent: '#06B6D4',     // Cyan — data/AI
-  background: '#0f172a', // Slate-900
-  surface: '#111827',    // Cards/panels
-  emerald: {
-    400: '#34d399',
-    500: '#10B981',
-    600: '#059669',
-  },
-  cyan: {
-    400: '#22d3ee',
-    500: '#06B6D4',
-    600: '#0891b2',
-  },
+  primary: '#43A047',     // Pitch Green
+  deep: '#2E7D32',        // Deep Green
+  forest: '#1B5E20',      // Forest Green
+  gold: '#E9C46A',        // Gold highlights
+  sky: '#42A5F5',         // Data/AI blue
+  coral: '#E76F51',       // Alerts/warnings
+  background: '#FAFAFA',  // Off-white
+  surface: '#FFFFFF',     // Cards
+  text: '#1A1A1A',        // Charcoal
+  textSecondary: '#444444',
+  textMuted: '#888888',
+  border: '#E0E0E0',
 } as const;
 
 export const SEVERITY_COLORS = {
-  critical: { bg: 'bg-red-500/20', text: 'text-red-400', border: 'border-red-500/30' },
-  high: { bg: 'bg-orange-500/20', text: 'text-orange-400', border: 'border-orange-500/30' },
-  medium: { bg: 'bg-amber-500/20', text: 'text-amber-400', border: 'border-amber-500/30' },
-  low: { bg: 'bg-blue-500/20', text: 'text-blue-400', border: 'border-blue-500/30' },
-  info: { bg: 'bg-slate-500/20', text: 'text-slate-400', border: 'border-slate-500/30' },
+  critical: { bg: 'bg-red-100', text: 'text-red-700', border: 'border-red-300' },
+  high: { bg: 'bg-orange-100', text: 'text-orange-700', border: 'border-orange-300' },
+  medium: { bg: 'bg-amber-100', text: 'text-amber-700', border: 'border-amber-300' },
+  low: { bg: 'bg-sky-100', text: 'text-sky-700', border: 'border-sky-300' },
+  info: { bg: 'bg-gray-100', text: 'text-gray-600', border: 'border-gray-300' },
 } as const;
 
 export const RATING_COLORS: Record<string, string> = {
-  Excellent: 'text-green-400',
-  Good: 'text-emerald-400',
-  Average: 'text-amber-400',
-  Poor: 'text-red-400',
+  Excellent: 'text-pitch-500',
+  Good: 'text-pitch-600',
+  Average: 'text-amber-600',
+  Poor: 'text-red-600',
 };
 
 export const PRIORITY_LABELS: Record<string, string> = {

@@ -7,15 +7,37 @@ export class ApiError extends Error {
   }
 }
 
+function getToken(): string | null {
+  return localStorage.getItem('mm_token');
+}
+
+function authHeaders(): Record<string, string> {
+  const token = getToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+function handle401() {
+  localStorage.removeItem('mm_token');
+  if (window.location.pathname !== '/login') {
+    window.location.href = '/login';
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const url = `${BASE_URL}${path}`;
   const res = await fetch(url, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders(),
       ...options?.headers,
     },
   });
+
+  if (res.status === 401) {
+    handle401();
+    throw new ApiError(401, 'Unauthorized');
+  }
 
   if (!res.ok) {
     const text = await res.text().catch(() => 'Unknown error');
@@ -33,6 +55,20 @@ export const api = {
     request<T>(path, { method: 'PUT', body: body ? JSON.stringify(body) : undefined }),
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
 
+  // Auth
+  login: (password: string) =>
+    request<{ access_token: string; token_type: string }>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+    }),
+
+  isAuthenticated: () => !!getToken(),
+
+  logout: () => {
+    localStorage.removeItem('mm_token');
+    window.location.href = '/login';
+  },
+
   // Raw fetch for file uploads (no JSON headers)
   upload: (path: string, formData: FormData, onProgress?: (pct: number) => void): Promise<{ video_id: string }> => {
     return new Promise((resolve, reject) => {
@@ -44,10 +80,13 @@ export const api = {
       }
       xhr.onload = () => {
         if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
+        else if (xhr.status === 401) { handle401(); reject(new ApiError(401, 'Unauthorized')); }
         else reject(new ApiError(xhr.status, xhr.responseText));
       };
       xhr.onerror = () => reject(new Error('Upload failed'));
       xhr.open('POST', `${BASE_URL}${path}`);
+      const token = getToken();
+      if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
       xhr.send(formData);
     });
   },
@@ -119,8 +158,12 @@ export const api = {
           const res = await fetch(`${BASE_URL}/api/video/upload/${upload_id}/chunk/${i}`, {
             method: 'PUT',
             body: chunk,
-            headers: { 'Content-Type': 'application/octet-stream' },
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              ...authHeaders(),
+            },
           });
+          if (res.status === 401) { handle401(); throw new ApiError(401, 'Unauthorized'); }
           if (!res.ok) throw new ApiError(res.status, await res.text());
           lastError = null;
           break;

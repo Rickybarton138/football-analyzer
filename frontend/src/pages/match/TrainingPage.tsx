@@ -19,7 +19,7 @@ export default function TrainingPage() {
   if (trainingError || !trainingFocus) {
     return (
       <EmptyState
-        icon={<Target className="w-8 h-8 text-slate-500" />}
+        icon={<Target className="w-8 h-8 text-text-muted" />}
         title="Training Focus Unavailable"
         description={trainingError || 'No training data available for this match.'}
         action={<Button variant="secondary" size="sm" onClick={loadTrainingFocus}>Retry</Button>}
@@ -32,15 +32,15 @@ export default function TrainingPage() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="bg-gradient-to-r from-emerald-500/10 to-cyan-500/10 rounded-2xl p-6 border border-emerald-500/20">
+      <div className="bg-pitch-light rounded-card p-6 border border-pitch/20">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-12 h-12 bg-gradient-to-br from-emerald-500 to-cyan-500 rounded-xl flex items-center justify-center">
+            <div className="w-12 h-12 bg-gradient-to-br from-pitch-deep to-pitch rounded-card flex items-center justify-center">
               <Target className="w-6 h-6 text-white" />
             </div>
             <div>
-              <h2 className="text-xl font-bold text-white">Training Focus</h2>
-              <p className="text-slate-400 text-sm">AI-generated drills based on match weaknesses</p>
+              <h2 className="text-xl font-bold text-text-primary">Training Focus</h2>
+              <p className="text-text-muted text-sm">AI-generated drills based on match weaknesses</p>
             </div>
           </div>
           <Button variant="secondary" size="sm" onClick={() => window.print()}>
@@ -52,7 +52,7 @@ export default function TrainingPage() {
       {/* Priority Areas */}
       {priority_areas && priority_areas.length > 0 && (
         <div>
-          <h3 className="text-lg font-semibold text-white mb-4">Priority Areas ({priority_areas.length})</h3>
+          <h3 className="text-lg font-semibold text-text-primary mb-4">Priority Areas ({priority_areas.length})</h3>
           <div className="grid gap-4">
             {priority_areas.map((area, i) => (
               <PriorityAreaCard key={i} area={area} index={i + 1} />
@@ -82,27 +82,27 @@ function PriorityAreaCard({ area, index }: { area: PriorityArea; index: number }
             {index}
           </div>
           <div>
-            <h4 className="text-white font-semibold">{area.area}</h4>
-            <p className="text-slate-400 text-sm capitalize">{area.team} team</p>
+            <h4 className="text-text-primary font-semibold">{area.area}</h4>
+            <p className="text-text-muted text-sm capitalize">{area.team} team</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
           <Badge variant={area.severity === 'high' ? 'critical' : 'medium'}>
             {area.severity === 'high' ? 'High Priority' : 'Medium'}
           </Badge>
-          {area.metric && <span className="text-slate-300 text-sm font-mono">{area.metric}</span>}
+          {area.metric && <span className="text-text-secondary text-sm font-mono">{area.metric}</span>}
         </div>
       </div>
 
-      <div className="bg-slate-800/50 rounded-xl p-4 mt-3">
-        <div className="flex items-center gap-2 text-emerald-400 text-sm font-semibold mb-2">
+      <div className="bg-surface-alt rounded-card p-4 mt-3">
+        <div className="flex items-center gap-2 text-pitch text-sm font-semibold mb-2">
           <Target className="w-4 h-4" />
           Recommended Drill
         </div>
-        <h5 className="text-white font-medium mb-1">{area.drill}</h5>
-        <p className="text-slate-400 text-sm">{area.detail}</p>
+        <h5 className="text-text-primary font-medium mb-1">{area.drill}</h5>
+        <p className="text-text-muted text-sm">{area.detail}</p>
         {area.duration_mins > 0 && (
-          <div className="flex items-center gap-1 text-slate-500 text-xs mt-2">
+          <div className="flex items-center gap-1 text-text-muted text-xs mt-2">
             <Clock className="w-3 h-3" /> {area.duration_mins} minutes
           </div>
         )}
@@ -125,8 +125,8 @@ function SessionPlanView({ plan }: { plan: SessionPlan }) {
   return (
     <div className="print:break-before-page">
       <div className="flex items-center justify-between mb-4">
-        <h3 className="text-lg font-semibold text-white">Session Plan</h3>
-        <span className="text-slate-400 text-sm flex items-center gap-1">
+        <h3 className="text-lg font-semibold text-text-primary">Session Plan</h3>
+        <span className="text-text-muted text-sm flex items-center gap-1">
           <Clock className="w-4 h-4" /> {totalMins} minutes total
         </span>
       </div>
@@ -142,24 +142,24 @@ function SessionPlanView({ plan }: { plan: SessionPlan }) {
                 <div className={cn('w-10 h-10 rounded-full bg-gradient-to-br flex items-center justify-center text-white font-bold text-sm', block.color)}>
                   {block.icon}
                 </div>
-                {i < blocks.length - 1 && <div className="w-0.5 flex-1 bg-slate-700 my-1" />}
+                {i < blocks.length - 1 && <div className="w-0.5 flex-1 bg-border my-1" />}
               </div>
 
               {/* Content */}
               <Card className="flex-1">
                 <div className="flex items-center justify-between mb-2">
-                  <h4 className="text-white font-semibold">{block.label}</h4>
+                  <h4 className="text-text-primary font-semibold">{block.label}</h4>
                   {d.duration_mins && (
-                    <span className="text-slate-400 text-xs flex items-center gap-1">
+                    <span className="text-text-muted text-xs flex items-center gap-1">
                       <Clock className="w-3 h-3" /> {d.duration_mins} min
                     </span>
                   )}
                 </div>
-                {d.activity && <p className="text-slate-300 text-sm">{d.activity}</p>}
-                {d.area && <p className="text-emerald-400 text-sm font-medium">{d.area}</p>}
-                {d.drill && <p className="text-slate-300 text-sm mt-1">{d.drill}</p>}
-                {d.detail && <p className="text-slate-400 text-sm mt-1">{d.detail}</p>}
-                {d.conditions && <p className="text-slate-400 text-sm mt-1">Conditions: {d.conditions}</p>}
+                {d.activity && <p className="text-text-secondary text-sm">{d.activity}</p>}
+                {d.area && <p className="text-pitch text-sm font-medium">{d.area}</p>}
+                {d.drill && <p className="text-text-secondary text-sm mt-1">{d.drill}</p>}
+                {d.detail && <p className="text-text-muted text-sm mt-1">{d.detail}</p>}
+                {d.conditions && <p className="text-text-muted text-sm mt-1">Conditions: {d.conditions}</p>}
               </Card>
             </div>
           );

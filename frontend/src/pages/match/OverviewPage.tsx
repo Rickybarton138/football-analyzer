@@ -34,21 +34,21 @@ export default function OverviewPage() {
   return (
     <div className="space-y-6">
       {/* Match Summary Header */}
-      <div className="bg-gradient-to-r from-emerald-500/10 via-cyan-500/5 to-emerald-500/10 rounded-2xl p-6 border border-emerald-500/20">
+      <div className="bg-pitch-light rounded-card p-6 border border-pitch/20">
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h2 className="text-2xl font-bold text-white">Match Overview</h2>
-            <p className="text-slate-400 text-sm">{formatDuration(analysis.duration_seconds)} analyzed &middot; {analysis.analyzed_frames} frames</p>
+            <h2 className="text-2xl font-bold text-text-primary">Match Overview</h2>
+            <p className="text-text-muted text-sm">{formatDuration(analysis.duration_seconds)} analyzed &middot; {analysis.analyzed_frames} frames</p>
           </div>
           {summary?.overall_rating && (
             <div className="text-right">
-              <span className="text-slate-400 text-xs block mb-1">AI Rating</span>
-              <span className="text-2xl font-bold text-emerald-400">{summary.overall_rating}</span>
+              <span className="text-text-muted text-xs block mb-1">AI Rating</span>
+              <span className="text-2xl font-bold text-pitch">{summary.overall_rating}</span>
             </div>
           )}
         </div>
         {summary?.tactical_summary && (
-          <p className="text-slate-300 text-sm">{summary.tactical_summary}</p>
+          <p className="text-text-secondary text-sm">{summary.tactical_summary}</p>
         )}
       </div>
 
@@ -56,8 +56,8 @@ export default function OverviewPage() {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard label="Avg Home Players" value={stats.avgHomePlayers.toFixed(1)} icon={<Users className="w-5 h-5" />} color="text-blue-400" />
         <StatCard label="Avg Away Players" value={stats.avgAwayPlayers.toFixed(1)} icon={<Users className="w-5 h-5" />} color="text-red-400" />
-        <StatCard label="Territorial Adv." value={`${stats.territorialAdvantage.home}%`} icon={<Crosshair className="w-5 h-5" />} color="text-emerald-400" />
-        <StatCard label="Pressing Actions" value={String(stats.pressingActions.home)} icon={<Shield className="w-5 h-5" />} color="text-cyan-400" />
+        <StatCard label="Territorial Adv." value={`${stats.territorialAdvantage.home}%`} icon={<Crosshair className="w-5 h-5" />} color="text-pitch" />
+        <StatCard label="Pressing Actions" value={String(stats.pressingActions.home)} icon={<Shield className="w-5 h-5" />} color="text-sky" />
       </div>
 
       {/* Possession + Zones */}
@@ -78,13 +78,13 @@ export default function OverviewPage() {
             <div className="space-y-3">
               <div className="flex items-center gap-3">
                 <div className="w-3 h-3 bg-blue-500 rounded-full" />
-                <span className="text-white font-medium">{stats.possession.home}%</span>
-                <span className="text-slate-400 text-sm">Home</span>
+                <span className="text-text-primary font-medium">{stats.possession.home}%</span>
+                <span className="text-text-muted text-sm">Home</span>
               </div>
               <div className="flex items-center gap-3">
                 <div className="w-3 h-3 bg-red-500 rounded-full" />
-                <span className="text-white font-medium">{stats.possession.away}%</span>
-                <span className="text-slate-400 text-sm">Away</span>
+                <span className="text-text-primary font-medium">{stats.possession.away}%</span>
+                <span className="text-text-muted text-sm">Away</span>
               </div>
             </div>
           </div>
@@ -96,10 +96,10 @@ export default function OverviewPage() {
             {['Defensive', 'Midfield', 'Attacking'].map((zone, i) => (
               <div key={zone}>
                 <div className="flex justify-between text-sm mb-1">
-                  <span className="text-slate-400">{zone}</span>
-                  <span className="text-slate-300">{stats.possessionByZone[i]?.home || 0}% — {stats.possessionByZone[i]?.away || 0}%</span>
+                  <span className="text-text-muted">{zone}</span>
+                  <span className="text-text-secondary">{stats.possessionByZone[i]?.home || 0}% — {stats.possessionByZone[i]?.away || 0}%</span>
                 </div>
-                <div className="flex h-2 rounded-full overflow-hidden bg-slate-700">
+                <div className="flex h-2 rounded-full overflow-hidden bg-surface-alt">
                   <div className="bg-blue-500" style={{ width: `${stats.possessionByZone[i]?.home || 0}%` }} />
                   <div className="flex-1" />
                   <div className="bg-red-500" style={{ width: `${stats.possessionByZone[i]?.away || 0}%` }} />
@@ -114,14 +114,14 @@ export default function OverviewPage() {
       {summary && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {summary.key_strengths && summary.key_strengths.length > 0 && (
-            <Card className="border-emerald-500/20">
-              <CardTitle className="flex items-center gap-2 text-emerald-400">
+            <Card className="border-pitch/20">
+              <CardTitle className="flex items-center gap-2 text-pitch">
                 <TrendingUp className="w-5 h-5" /> Key Strengths
               </CardTitle>
               <ul className="space-y-2 mt-3">
                 {summary.key_strengths.map((s, i) => (
-                  <li key={i} className="text-slate-300 text-sm flex items-start gap-2">
-                    <span className="text-emerald-500 mt-0.5">&#x2022;</span> {s}
+                  <li key={i} className="text-text-secondary text-sm flex items-start gap-2">
+                    <span className="text-pitch-deep mt-0.5">&#x2022;</span> {s}
                   </li>
                 ))}
               </ul>
@@ -134,7 +134,7 @@ export default function OverviewPage() {
               </CardTitle>
               <ul className="space-y-2 mt-3">
                 {summary.areas_to_improve.map((a, i) => (
-                  <li key={i} className="text-slate-300 text-sm flex items-start gap-2">
+                  <li key={i} className="text-text-secondary text-sm flex items-start gap-2">
                     <span className="text-amber-500 mt-0.5">&#x2022;</span> {a}
                   </li>
                 ))}
@@ -151,15 +151,15 @@ export default function OverviewPage() {
           <div className="grid gap-3 mt-3">
             {stats.insights.map((insight, i) => (
               <div key={i} className={cn('rounded-lg p-4 border',
-                insight.type === 'positive' ? 'bg-emerald-500/10 border-emerald-500/20' :
+                insight.type === 'positive' ? 'bg-pitch-light border-pitch/20' :
                 insight.type === 'warning' ? 'bg-amber-500/10 border-amber-500/20' :
-                'bg-slate-800/50 border-slate-700/30'
+                'bg-surface-alt border-border'
               )}>
                 <h4 className={cn('font-semibold text-sm mb-1',
-                  insight.type === 'positive' ? 'text-emerald-400' :
-                  insight.type === 'warning' ? 'text-amber-400' : 'text-slate-300'
+                  insight.type === 'positive' ? 'text-pitch' :
+                  insight.type === 'warning' ? 'text-amber-400' : 'text-text-secondary'
                 )}>{insight.title}</h4>
-                <p className="text-slate-400 text-sm">{insight.description}</p>
+                <p className="text-text-muted text-sm">{insight.description}</p>
               </div>
             ))}
           </div>
@@ -173,8 +173,8 @@ function StatCard({ label, value, icon, color }: { label: string; value: string;
   return (
     <Card className="text-center">
       <div className={cn('mx-auto mb-2', color)}>{icon}</div>
-      <div className="text-2xl font-bold text-white">{value}</div>
-      <div className="text-slate-400 text-xs mt-1">{label}</div>
+      <div className="text-2xl font-bold text-text-primary">{value}</div>
+      <div className="text-text-muted text-xs mt-1">{label}</div>
     </Card>
   );
 }

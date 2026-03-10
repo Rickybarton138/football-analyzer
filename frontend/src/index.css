@@ -3,11 +3,11 @@
 @tailwind utilities;
 
 :root {
-  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  line-height: 1.6;
   font-weight: 400;
-  color: #e2e8f0;
-  background-color: #0f172a;
+  color: #1A1A1A;
+  background-color: #FAFAFA;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -20,24 +20,24 @@ body {
   min-height: 100vh;
 }
 
-/* Custom scrollbar */
+/* Custom scrollbar — subtle on light theme */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #1e293b;
+  background: #F1F5F1;
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #475569;
+  background: #C8E6C9;
   border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #64748b;
+  background: #43A047;
 }
 
 /* Football pitch styling */
@@ -48,6 +48,12 @@ body {
     #3a7033 50%,
     #2d5a27 100%
   );
+}
+
+/* Video analysis dark zone */
+.video-zone {
+  background: #1A1A1A;
+  color: #E0E0E0;
 }
 
 /* Alert animations */
@@ -76,7 +82,7 @@ body {
     color: black !important;
   }
 
-  .print\\:break-before-page {
+  .print\:break-before-page {
     break-before: page;
   }
 

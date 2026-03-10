@@ -39,6 +39,7 @@ roboflow>=1.1.0
 
 # Video Processing
 # Note: FFmpeg must be installed separately on the system
+ffmpeg-python>=0.2.0
 
 # Database
 aiosqlite>=0.19.0
@@ -51,6 +52,13 @@ pandas>=2.0.0
 
 # Optional: Redis caching
 # redis>=5.0.0
+
+# AI Coaching (Claude + OpenAI Vision)
+anthropic>=0.40.0
+openai>=1.50.0
+
+# Auth
+python-jose[cryptography]>=3.3.0
 
 # Development
 python-dotenv>=1.0.0

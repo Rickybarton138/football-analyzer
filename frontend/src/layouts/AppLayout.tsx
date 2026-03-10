@@ -20,21 +20,23 @@ export default function AppLayout() {
       {/* Sidebar */}
       <aside
         className={cn(
-          'fixed inset-y-0 left-0 z-40 bg-surface border-r border-slate-700/50 transition-all duration-300 flex flex-col',
+          'fixed inset-y-0 left-0 z-40 bg-surface border-r border-border transition-all duration-300 flex flex-col shadow-sm',
           sidebarOpen ? 'w-56' : 'w-16'
         )}
       >
         {/* Logo */}
-        <div className="h-16 flex items-center px-4 border-b border-slate-700/50">
+        <div className="h-16 flex items-center px-4 border-b border-border">
           <Link to="/" className="flex items-center gap-2 min-w-0">
-            <div className="w-8 h-8 bg-gradient-to-br from-emerald-500 to-cyan-500 rounded-lg flex items-center justify-center flex-shrink-0">
-              <span className="text-white text-sm font-bold">D</span>
+            <div className="w-8 h-8 bg-gradient-to-br from-pitch-deep to-pitch rounded-lg flex items-center justify-center flex-shrink-0">
+              <span className="text-white text-sm font-bold">CM</span>
             </div>
             {sidebarOpen && (
-              <span className="text-lg font-bold truncate">
-                <span className="text-emerald-400">Dugout</span>
-                <span className="text-cyan-400">IQ</span>
-              </span>
+              <div className="flex flex-col min-w-0">
+                <span className="text-base font-bold text-text-primary leading-tight truncate">
+                  <span className="text-pitch">Coach</span><span className="text-pitch-deep">Mentor</span>
+                </span>
+                <span className="text-[10px] text-text-muted leading-none">Match Analysis</span>
+              </div>
             )}
           </Link>
         </div>
@@ -48,10 +50,10 @@ export default function AppLayout() {
                 key={item.path}
                 to={item.path}
                 className={cn(
-                  'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all',
+                  'flex items-center gap-3 px-3 py-2.5 rounded-btn text-sm font-medium transition-all',
                   isActive
-                    ? 'bg-emerald-500/10 text-emerald-400'
-                    : 'text-slate-400 hover:text-white hover:bg-slate-800'
+                    ? 'bg-pitch-light text-pitch-deep'
+                    : 'text-text-secondary hover:text-text-primary hover:bg-gray-100'
                 )}
                 title={!sidebarOpen ? item.label : undefined}
               >
@@ -65,7 +67,7 @@ export default function AppLayout() {
         {/* Toggle */}
         <button
           onClick={toggleSidebar}
-          className="h-12 flex items-center justify-center border-t border-slate-700/50 text-slate-400 hover:text-white transition-colors"
+          className="h-12 flex items-center justify-center border-t border-border text-text-muted hover:text-text-primary transition-colors"
         >
           {sidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
         </button>
