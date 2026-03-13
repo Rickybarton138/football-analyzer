@@ -30,7 +30,24 @@
       "WebFetch(domain:coachmentor-api.onrender.com)",
       "WebFetch(domain:coachmentor.onrender.com)",
       "Bash(powershell -Command:*)",
-      "Bash(git restore:*)"
+      "Bash(git restore:*)",
+      "Bash(npx cap sync:*)",
+      "Bash(npm start)",
+      "Bash(taskkill:*)",
+      "WebFetch(domain:www.sportsessionplanner.com)",
+      "WebFetch(domain:www.youcoach.com)",
+      "WebFetch(domain:themastermindsite.com)",
+      "WebFetch(domain:footballdna.co.uk)",
+      "Bash(cmd //c \"taskkill /F /PID 18780\")",
+      "Bash(cmd //c \"taskkill /F /PID 6468\")",
+      "Bash(cmd //c \"taskkill /F /PID 33864\")",
+      "Bash(cmd.exe:*)",
+      "Bash(kill:*)",
+      "Bash(powershell.exe:*)",
+      "Bash(done)",
+      "Bash(git log:*)",
+      "Bash(ls:*)",
+      "Bash(code:*)"
     ]
   }
 }
