@@ -202,27 +202,60 @@ async def process_video_pipeline(match_id: str, local_path: str, title: str, con
 async def process_url_pipeline(match_id: str, video_url: str, title: str):
     """Background: ingest video from URL into Mux + TwelveLabs."""
     try:
-        # Step 1: Create Mux asset from URL
-        logger.info("Creating Mux asset from URL for match %s", match_id)
-        asset = await mux.create_asset_from_url(video_url)
-        duration = asset.get("duration")
+        # Step 1: Stream video from URL → Mux upload
+        logger.info("Streaming video from URL to Mux for match %s", match_id)
+        upload = await mux.create_upload()
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=30.0)) as client:
+            # Stream from source URL to Mux upload URL (proxy, no local file)
+            async with client.stream("GET", video_url) as source:
+                source.raise_for_status()
+                content_type = source.headers.get("content-type", "video/mp4")
+                content_length = source.headers.get("content-length", "")
+
+                async def relay():
+                    async for chunk in source.aiter_bytes(chunk_size=4 * 1024 * 1024):
+                        yield chunk
+
+                resp = await client.put(
+                    upload["upload_url"],
+                    content=relay(),
+                    headers={
+                        "Content-Type": content_type,
+                        **({"Content-Length": content_length} if content_length else {}),
+                    },
+                )
+                resp.raise_for_status()
+
+        logger.info("Mux upload complete for match %s, waiting for asset", match_id)
 
         # Poll until Mux asset is ready
+        asset_id = None
+        duration = None
         for _ in range(120):
-            asset = await mux.get_asset(asset["asset_id"])
-            if asset["status"] == "ready":
-                duration = asset.get("duration")
-                await db.update("matches", match_id, {
-                    "mux_asset_id": asset["asset_id"],
-                    "mux_playback_id": asset["playback_id"],
-                    "duration_seconds": duration,
-                    "thumbnail_url": asset.get("thumbnail_url"),
-                })
-                logger.info("Mux asset ready for match %s", match_id)
+            asset_id = await mux.get_asset_from_upload(upload["upload_id"])
+            if asset_id:
                 break
             await asyncio.sleep(3)
+
+        if asset_id:
+            for _ in range(120):
+                asset = await mux.get_asset(asset_id)
+                if asset["status"] == "ready":
+                    duration = asset.get("duration")
+                    await db.update("matches", match_id, {
+                        "mux_asset_id": asset["asset_id"],
+                        "mux_playback_id": asset["playback_id"],
+                        "duration_seconds": duration,
+                        "thumbnail_url": asset.get("thumbnail_url"),
+                    })
+                    logger.info("Mux asset ready for match %s", match_id)
+                    break
+                await asyncio.sleep(3)
+            else:
+                logger.warning("Mux asset polling timed out for match %s", match_id)
         else:
-            logger.warning("Mux asset polling timed out for match %s", match_id)
+            logger.warning("Mux upload->asset timed out for match %s", match_id)
 
         # Step 2: Index with TwelveLabs from URL
         await db.update("matches", match_id, {"status": MatchStatus.indexing})

@@ -90,9 +90,9 @@ class TwelveLabsService:
 
     async def analyse_video(self, video_id: str, prompt: str) -> str:
         """Analyse a video with a custom prompt. Returns text analysis."""
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             resp = await client.post(
-                f"{self.base_url}/generate",
+                f"{self.base_url}/analyze",
                 json={
                     "video_id": video_id,
                     "prompt": prompt,
@@ -100,7 +100,19 @@ class TwelveLabsService:
                 headers=self.headers,
             )
             resp.raise_for_status()
-            return resp.json().get("data", "")
+            # Response is newline-delimited JSON stream
+            text_parts = []
+            for line in resp.text.strip().split("\n"):
+                if not line.strip():
+                    continue
+                import json
+                try:
+                    event = json.loads(line)
+                    if event.get("event_type") == "text_generation":
+                        text_parts.append(event.get("text", ""))
+                except json.JSONDecodeError:
+                    continue
+            return "".join(text_parts)
 
     async def get_highlights(self, video_id: str) -> list[dict]:
         """Get auto-generated highlights with timestamps."""
