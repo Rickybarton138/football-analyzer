@@ -2,7 +2,8 @@ import { useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
-import { Play, Brain, MessageSquare, ClipboardList, Loader2, Send } from 'lucide-react';
+import { Play, Brain, MessageSquare, ClipboardList, Loader2, Send, Users, AlertTriangle } from 'lucide-react';
+import MuxPlayer from '@mux/mux-player-react';
 
 export default function MatchView() {
   const { id } = useParams<{ id: string }>();
@@ -12,7 +13,7 @@ export default function MatchView() {
 
   const { data: match, isLoading } = useQuery({
     queryKey: ['match', id],
-    queryFn: () => api.getMatch(id!),
+    queryFn: () => api.getMatchStatus(id!),
     refetchInterval: (query) => {
       const m = query.state.data as any;
       return m?.status === 'ready' || m?.status === 'failed' ? false : 3000;
@@ -23,6 +24,12 @@ export default function MatchView() {
     queryKey: ['analyses', id],
     queryFn: () => api.getMatchAnalyses(id!),
     enabled: (match as any)?.status === 'ready',
+    refetchInterval: (query) => {
+      const list = query.state.data as any[];
+      if (!list?.length) return false;
+      const hasProcessing = list.some((a: any) => a.status === 'processing');
+      return hasProcessing ? 5000 : false;
+    },
   });
 
   const runAnalysis = useMutation({
@@ -51,7 +58,9 @@ export default function MatchView() {
   }
 
   const m = match as any;
-  const latestAnalysis = (analyses as any[])?.[0];
+  const analysisList = (analyses as any[]) || [];
+  const latestAnalysis = analysisList.find((a: any) => a.status === 'complete');
+  const processingAnalysis = analysisList.find((a: any) => a.status === 'processing');
 
   return (
     <div className="space-y-8">
@@ -59,14 +68,23 @@ export default function MatchView() {
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
         <div className="aspect-video bg-black">
           {m?.mux_playback_id ? (
-            <iframe
-              src={`https://stream.mux.com/${m.mux_playback_id}.m3u8`}
+            <MuxPlayer
+              playbackId={m.mux_playback_id}
+              streamType="on-demand"
+              accentColor="#10b981"
               className="w-full h-full"
-              allow="autoplay; fullscreen"
             />
           ) : (
             <div className="w-full h-full flex items-center justify-center text-zinc-600">
-              {m?.status !== 'ready' ? (
+              {m?.status === 'failed' ? (
+                <div className="text-center">
+                  <AlertTriangle className="w-8 h-8 text-red-400 mx-auto mb-2" />
+                  <p className="text-red-400">Processing failed</p>
+                  {m?.error_message && (
+                    <p className="text-xs text-zinc-500 mt-1 max-w-md">{m.error_message}</p>
+                  )}
+                </div>
+              ) : m?.status !== 'ready' ? (
                 <div className="text-center">
                   <Loader2 className="w-8 h-8 animate-spin mx-auto mb-2" />
                   <p className="capitalize">{m?.status}...</p>
@@ -89,39 +107,60 @@ export default function MatchView() {
 
       {/* Analysis Actions */}
       {m?.status === 'ready' && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <button
-            onClick={() => runAnalysis.mutate('full')}
-            disabled={runAnalysis.isPending}
-            className="flex items-center justify-center gap-2 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20 py-3 rounded-lg font-medium transition-colors"
-          >
-            <Brain className="w-4 h-4" />
-            Full Analysis
-          </button>
-          <button
-            onClick={() => runAnalysis.mutate('highlights')}
-            disabled={runAnalysis.isPending}
-            className="flex items-center justify-center gap-2 bg-amber-500/10 border border-amber-500/20 text-amber-400 hover:bg-amber-500/20 py-3 rounded-lg font-medium transition-colors"
-          >
-            <Play className="w-4 h-4" />
-            Highlights
-          </button>
-          <button
-            onClick={() => runAnalysis.mutate('tactical')}
-            disabled={runAnalysis.isPending}
-            className="flex items-center justify-center gap-2 bg-blue-500/10 border border-blue-500/20 text-blue-400 hover:bg-blue-500/20 py-3 rounded-lg font-medium transition-colors"
-          >
-            <Brain className="w-4 h-4" />
-            Tactical
-          </button>
-          <button
-            onClick={() => sessionPlan.mutate()}
-            disabled={sessionPlan.isPending || !latestAnalysis}
-            className="flex items-center justify-center gap-2 bg-purple-500/10 border border-purple-500/20 text-purple-400 hover:bg-purple-500/20 py-3 rounded-lg font-medium transition-colors disabled:opacity-40"
-          >
-            <ClipboardList className="w-4 h-4" />
-            Session Plan
-          </button>
+        <div>
+          {processingAnalysis && (
+            <div className="flex items-center gap-2 text-sm text-amber-400 mb-3">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Analysis running...
+            </div>
+          )}
+          {runAnalysis.isError && (
+            <div className="bg-red-500/10 border border-red-500/20 text-red-400 px-3 py-2 rounded-lg mb-3 text-sm">
+              {(runAnalysis.error as Error).message}
+            </div>
+          )}
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <button
+              onClick={() => runAnalysis.mutate('full')}
+              disabled={runAnalysis.isPending}
+              className="flex items-center justify-center gap-2 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20 py-3 rounded-lg font-medium transition-colors"
+            >
+              <Brain className="w-4 h-4" />
+              Full Analysis
+            </button>
+            <button
+              onClick={() => runAnalysis.mutate('highlights')}
+              disabled={runAnalysis.isPending}
+              className="flex items-center justify-center gap-2 bg-amber-500/10 border border-amber-500/20 text-amber-400 hover:bg-amber-500/20 py-3 rounded-lg font-medium transition-colors"
+            >
+              <Play className="w-4 h-4" />
+              Highlights
+            </button>
+            <button
+              onClick={() => runAnalysis.mutate('tactical')}
+              disabled={runAnalysis.isPending}
+              className="flex items-center justify-center gap-2 bg-blue-500/10 border border-blue-500/20 text-blue-400 hover:bg-blue-500/20 py-3 rounded-lg font-medium transition-colors"
+            >
+              <Brain className="w-4 h-4" />
+              Tactical
+            </button>
+            <button
+              onClick={() => runAnalysis.mutate('player_spotlight')}
+              disabled={runAnalysis.isPending}
+              className="flex items-center justify-center gap-2 bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 hover:bg-cyan-500/20 py-3 rounded-lg font-medium transition-colors"
+            >
+              <Users className="w-4 h-4" />
+              Players
+            </button>
+            <button
+              onClick={() => sessionPlan.mutate()}
+              disabled={sessionPlan.isPending || !latestAnalysis}
+              className="flex items-center justify-center gap-2 bg-purple-500/10 border border-purple-500/20 text-purple-400 hover:bg-purple-500/20 py-3 rounded-lg font-medium transition-colors disabled:opacity-40"
+            >
+              <ClipboardList className="w-4 h-4" />
+              Session Plan
+            </button>
+          </div>
         </div>
       )}
 
@@ -154,6 +193,15 @@ export default function MatchView() {
               </div>
             </div>
           )}
+
+          {latestAnalysis.player_analysis_raw && (
+            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+              <h2 className="text-lg font-semibold text-cyan-400 mb-3">Player Analysis</h2>
+              <div className="prose prose-invert prose-sm max-w-none whitespace-pre-wrap">
+                {latestAnalysis.player_analysis_raw}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -181,6 +229,10 @@ export default function MatchView() {
               <p className="text-sm text-zinc-300 mt-1 whitespace-pre-wrap">{chat.a}</p>
             </div>
           ))}
+
+          {askMutation.isError && (
+            <p className="text-sm text-red-400 mb-2">{(askMutation.error as Error).message}</p>
+          )}
 
           <div className="flex gap-2">
             <input

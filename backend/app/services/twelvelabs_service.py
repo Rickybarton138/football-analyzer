@@ -18,7 +18,7 @@ class TwelveLabsService:
             "Content-Type": "application/json",
         }
 
-    async def index_video_from_file(self, file_path: str, title: str = "") -> dict:
+    async def index_video_from_file(self, file_path: str, title: str = "", content_type: str = "video/mp4") -> dict:
         """Upload a local video file for indexing. Returns task info."""
         import os
         headers = {"x-api-key": self.api_key}
@@ -27,7 +27,7 @@ class TwelveLabsService:
                 resp = await client.post(
                     f"{self.base_url}/tasks",
                     data={"index_id": self.index_id},
-                    files={"video_file": (os.path.basename(file_path), f, "video/mp4")},
+                    files={"video_file": (os.path.basename(file_path), f, content_type)},
                     headers=headers,
                 )
             resp.raise_for_status()
@@ -98,6 +98,7 @@ class TwelveLabsService:
 
     async def get_tactical_analysis(self, video_id: str, context: str = "") -> str:
         """Get detailed tactical analysis of the match."""
+        coach_line = f"\nAdditional context from the coach: {context}" if context else ""
         prompt = (
             "You are an experienced football coach analysing match footage. Provide a detailed "
             "tactical analysis covering:\n"
@@ -108,7 +109,7 @@ class TwelveLabsService:
             "5. Set pieces - any notable patterns\n"
             "6. Key weaknesses to address in training\n"
             "7. Key strengths to reinforce\n"
-            f"\nAdditional context from the coach: {context}" if context else ""
+            + coach_line
         )
         return await self.analyse_video(video_id, prompt)
 

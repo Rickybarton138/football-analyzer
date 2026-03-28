@@ -1,14 +1,19 @@
 """Match upload, listing, and management endpoints."""
 
+import logging
+import mimetypes
 import os
 import uuid
 import asyncio
 import aiofiles
+import httpx
 from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File, Form
 from app.models.schemas import MatchCreate, MatchResponse, MatchStatus
 from app.services.mux_service import MuxService
 from app.services.twelvelabs_service import TwelveLabsService
 from app.services.supabase_service import SupabaseService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 mux = MuxService()
@@ -18,12 +23,7 @@ db = SupabaseService()
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-
-@router.post("/upload-url")
-async def get_upload_url():
-    """Get a Mux direct upload URL for the frontend."""
-    upload = await mux.create_upload()
-    return upload
+MAX_UPLOAD_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 
 
 @router.post("/upload")
@@ -40,10 +40,19 @@ async def upload_match(
 
     # Save file locally using chunked streaming (handles large files)
     file_ext = os.path.splitext(video.filename or "video.mp4")[1]
+    content_type = video.content_type or mimetypes.guess_type(video.filename or "")[0] or "video/mp4"
     local_path = os.path.join(UPLOAD_DIR, f"{match_id}{file_ext}")
+
+    total_size = 0
     async with aiofiles.open(local_path, "wb") as f:
         while chunk := await video.read(1024 * 1024):  # 1MB chunks
+            total_size += len(chunk)
+            if total_size > MAX_UPLOAD_SIZE:
+                os.remove(local_path)
+                raise HTTPException(413, "File too large. Maximum 2GB.")
             await f.write(chunk)
+
+    logger.info("Saved %s (%d MB) to %s", video.filename, total_size // (1024 * 1024), local_path)
 
     # Create match record
     record = await db.insert("matches", {
@@ -56,24 +65,36 @@ async def upload_match(
     })
 
     # Process in background: Mux upload + TwelveLabs indexing
-    background_tasks.add_task(process_video_pipeline, match_id, local_path, title)
+    background_tasks.add_task(process_video_pipeline, match_id, local_path, title, content_type)
 
     return record
 
 
-async def process_video_pipeline(match_id: str, local_path: str, title: str):
+async def process_video_pipeline(match_id: str, local_path: str, title: str, content_type: str):
     """Background: upload to Mux for streaming + index with TwelveLabs for analysis."""
     try:
-        # Step 1: Upload to Mux
+        # Step 1: Upload to Mux via streaming (no full-file memory load)
         upload = await mux.create_upload()
-        import httpx
-        async with httpx.AsyncClient(timeout=600) as client:
-            with open(local_path, "rb") as f:
-                resp = await client.put(
-                    upload["upload_url"],
-                    content=f,
-                    headers={"Content-Type": "video/mp4"},
-                )
+        file_size = os.path.getsize(local_path)
+        logger.info("Uploading %d MB to Mux for match %s", file_size // (1024 * 1024), match_id)
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0)) as client:
+            async def stream_file():
+                async with aiofiles.open(local_path, "rb") as f:
+                    while chunk := await f.read(4 * 1024 * 1024):  # 4MB chunks
+                        yield chunk
+
+            resp = await client.put(
+                upload["upload_url"],
+                content=stream_file(),
+                headers={
+                    "Content-Type": content_type,
+                    "Content-Length": str(file_size),
+                },
+            )
+            resp.raise_for_status()
+
+        logger.info("Mux upload complete for match %s, waiting for asset", match_id)
 
         # Wait for Mux to process the upload into an asset
         asset_id = None
@@ -84,7 +105,6 @@ async def process_video_pipeline(match_id: str, local_path: str, title: str):
             await asyncio.sleep(3)
 
         if asset_id:
-            # Wait for asset to be ready
             for _ in range(60):
                 asset = await mux.get_asset(asset_id)
                 if asset["status"] == "ready":
@@ -94,26 +114,60 @@ async def process_video_pipeline(match_id: str, local_path: str, title: str):
                         "duration_seconds": asset.get("duration"),
                         "thumbnail_url": asset.get("thumbnail_url"),
                     })
+                    logger.info("Mux asset ready for match %s: %s", match_id, asset["asset_id"])
                     break
                 await asyncio.sleep(3)
+            else:
+                logger.warning("Mux asset polling timed out for match %s", match_id)
+        else:
+            logger.warning("Mux upload->asset resolution timed out for match %s", match_id)
 
         # Step 2: Index with TwelveLabs from local file
         await db.update("matches", match_id, {"status": MatchStatus.indexing})
-        result = await twelvelabs.index_video_from_file(local_path, title)
+        logger.info("Starting TwelveLabs indexing for match %s", match_id)
+        result = await twelvelabs.index_video_from_file(local_path, title, content_type)
         await db.update("matches", match_id, {
             "twelvelabs_task_id": result["task_id"],
             "twelvelabs_video_id": result.get("video_id"),
         })
+        logger.info("TwelveLabs task submitted for match %s: %s", match_id, result["task_id"])
+
+        # Step 3: Poll TwelveLabs until ready (so status transitions autonomously)
+        for _ in range(120):  # up to ~10 minutes
+            await asyncio.sleep(5)
+            task = await twelvelabs.get_task_status(result["task_id"])
+            if task["status"] == "ready":
+                await db.update("matches", match_id, {
+                    "status": MatchStatus.ready,
+                    "twelvelabs_video_id": task["video_id"],
+                })
+                logger.info("Match %s is READY", match_id)
+                return
+            elif task["status"] == "failed":
+                await db.update("matches", match_id, {
+                    "status": MatchStatus.failed,
+                    "error_message": "TwelveLabs indexing failed",
+                })
+                logger.error("TwelveLabs indexing failed for match %s", match_id)
+                return
+
+        # If we get here, polling timed out
+        await db.update("matches", match_id, {
+            "status": MatchStatus.failed,
+            "error_message": "TwelveLabs indexing timed out after 10 minutes",
+        })
+        logger.error("TwelveLabs polling timed out for match %s", match_id)
 
     except Exception as e:
+        logger.exception("Pipeline failed for match %s", match_id)
         await db.update("matches", match_id, {
             "status": MatchStatus.failed,
             "error_message": str(e),
         })
     finally:
-        # Clean up local file
         try:
             os.remove(local_path)
+            logger.info("Cleaned up local file for match %s", match_id)
         except OSError:
             pass
 

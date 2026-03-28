@@ -69,11 +69,12 @@ async def run_analysis_pipeline(
             update_data["coaching_advice"] = coaching["coaching_advice"]
 
         elif analysis_type == AnalysisType.player_spotlight:
+            coach_line = f"\nCoach's notes: {coach_context}" if coach_context else ""
             prompt = (
                 "Identify each individual player visible in this football match. "
                 "For each player, describe: their position, key moments, "
-                "notable actions (good and bad), and an overall assessment. "
-                f"Coach's notes: {coach_context}" if coach_context else ""
+                "notable actions (good and bad), and an overall assessment."
+                + coach_line
             )
             analysis = await twelvelabs.analyse_video(video_id, prompt)
             update_data["player_analysis_raw"] = analysis

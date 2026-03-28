@@ -1,10 +1,11 @@
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8002/api';
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    ...options,
-  });
+  const headers: Record<string, string> = { ...options?.headers as Record<string, string> };
+  if (!headers['Content-Type'] && options?.body && typeof options.body === 'string') {
+    headers['Content-Type'] = 'application/json';
+  }
+  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || err.message || 'Request failed');
@@ -12,21 +13,11 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
-// Matches
 export const api = {
-  // Upload
-  getUploadUrl: () => request<{ upload_id: string; upload_url: string }>('/matches/upload-url', { method: 'POST' }),
-
   // Matches
-  createMatch: (data: { title: string; opponent?: string; formation?: string; notes?: string }) =>
-    request('/matches', { method: 'POST', body: JSON.stringify(data) }),
-
-  processMatch: (matchId: string, muxUploadId: string) =>
-    request(`/matches/${matchId}/process?mux_upload_id=${muxUploadId}`, { method: 'POST' }),
-
-  getMatchStatus: (matchId: string) => request(`/matches/${matchId}/status`),
   listMatches: () => request<any[]>('/matches'),
   getMatch: (matchId: string) => request(`/matches/${matchId}`),
+  getMatchStatus: (matchId: string) => request(`/matches/${matchId}/status`),
 
   // Analysis
   runAnalysis: (data: { match_id: string; analysis_type?: string; prompt?: string }) =>

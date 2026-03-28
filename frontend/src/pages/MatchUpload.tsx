@@ -1,13 +1,12 @@
 import { useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api } from '../lib/api';
 import { Upload, Loader2, CheckCircle } from 'lucide-react';
 
-type Step = 'details' | 'uploading' | 'processing' | 'done';
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8002/api';
 
 export default function MatchUpload() {
   const navigate = useNavigate();
-  const [step, setStep] = useState<Step>('details');
+  const [step, setStep] = useState<'details' | 'uploading' | 'processing'>('details');
   const [title, setTitle] = useState('');
   const [opponent, setOpponent] = useState('');
   const [formation, setFormation] = useState('');
@@ -23,7 +22,6 @@ export default function MatchUpload() {
     try {
       setStep('uploading');
 
-      // Upload video + metadata to our backend in one request
       const formData = new FormData();
       formData.append('video', file);
       formData.append('title', title);
@@ -41,15 +39,16 @@ export default function MatchUpload() {
           if (xhr.status >= 200 && xhr.status < 300) {
             resolve(JSON.parse(xhr.responseText));
           } else {
-            reject(new Error('Upload failed'));
+            let msg = 'Upload failed';
+            try { msg = JSON.parse(xhr.responseText).detail || msg; } catch {}
+            reject(new Error(msg));
           }
         };
-        xhr.onerror = () => reject(new Error('Upload failed'));
-        xhr.open('POST', 'http://localhost:8002/api/matches/upload');
+        xhr.onerror = () => reject(new Error('Upload failed — check your connection'));
+        xhr.open('POST', `${API_BASE}/matches/upload`);
         xhr.send(formData);
       });
 
-      // Processing happens in background on the server
       setStep('processing');
       setTimeout(() => navigate(`/match/${match.id}`), 2000);
 
@@ -71,7 +70,6 @@ export default function MatchUpload() {
 
       {step === 'details' && (
         <div className="space-y-6">
-          {/* File drop */}
           <label className="block border-2 border-dashed border-zinc-700 rounded-xl p-8 text-center cursor-pointer hover:border-emerald-500/50 transition-colors">
             <input
               type="file"
@@ -89,12 +87,11 @@ export default function MatchUpload() {
               <div>
                 <Upload className="w-8 h-8 text-zinc-500 mx-auto mb-2" />
                 <p className="text-zinc-400">Drop match video here or click to browse</p>
-                <p className="text-sm text-zinc-600 mt-1">MP4, MOV, AVI up to 5GB</p>
+                <p className="text-sm text-zinc-600 mt-1">MP4, MOV, WebM up to 2GB</p>
               </div>
             )}
           </label>
 
-          {/* Match details */}
           <div className="grid grid-cols-2 gap-4">
             <div className="col-span-2">
               <label className="block text-sm font-medium text-zinc-400 mb-1">Match Title *</label>
@@ -151,7 +148,7 @@ export default function MatchUpload() {
       {step === 'uploading' && (
         <div className="text-center py-12">
           <Loader2 className="w-12 h-12 text-emerald-400 animate-spin mx-auto mb-4" />
-          <h3 className="text-xl font-medium">Uploading to Mux...</h3>
+          <h3 className="text-xl font-medium">Uploading video...</h3>
           <div className="mt-4 w-full bg-zinc-800 rounded-full h-2">
             <div
               className="bg-emerald-500 h-2 rounded-full transition-all duration-300"
@@ -167,14 +164,6 @@ export default function MatchUpload() {
           <Loader2 className="w-12 h-12 text-blue-400 animate-spin mx-auto mb-4" />
           <h3 className="text-xl font-medium">Processing & Indexing...</h3>
           <p className="text-zinc-400 mt-2">TwelveLabs is analysing your footage. This may take a few minutes.</p>
-        </div>
-      )}
-
-      {step === 'done' && (
-        <div className="text-center py-12">
-          <CheckCircle className="w-12 h-12 text-emerald-400 mx-auto mb-4" />
-          <h3 className="text-xl font-medium">Upload Complete!</h3>
-          <p className="text-zinc-400 mt-2">Redirecting to match view...</p>
         </div>
       )}
     </div>
