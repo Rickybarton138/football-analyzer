@@ -15,6 +15,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   // Matches
+  uploadFromUrl: (data: { video_url: string; title: string; opponent?: string; formation?: string; notes?: string }) =>
+    request('/matches/upload-url', { method: 'POST', body: JSON.stringify(data) }),
+
   listMatches: () => request<any[]>('/matches'),
   getMatch: (matchId: string) => request(`/matches/${matchId}`),
   getMatchStatus: (matchId: string) => request(`/matches/${matchId}/status`),

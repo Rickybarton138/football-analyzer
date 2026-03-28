@@ -37,6 +37,28 @@ class MuxService:
                 "asset_id": data.get("asset_id"),
             }
 
+    async def create_asset_from_url(self, video_url: str) -> dict:
+        """Create a Mux asset directly from a video URL (no upload needed)."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self.base_url}/video/v1/assets",
+                json={
+                    "input": [{"url": video_url}],
+                    "playback_policy": ["public"],
+                    "encoding_tier": "baseline",
+                },
+                auth=self.auth,
+            )
+            resp.raise_for_status()
+            asset = resp.json()["data"]
+            playback_ids = asset.get("playback_ids", [])
+            return {
+                "asset_id": asset["id"],
+                "status": asset["status"],
+                "playback_id": playback_ids[0]["id"] if playback_ids else None,
+                "duration": asset.get("duration"),
+            }
+
     async def get_asset(self, asset_id: str) -> dict:
         """Get asset details including playback IDs and status."""
         async with httpx.AsyncClient() as client:

@@ -7,6 +7,7 @@ import uuid
 import asyncio
 import aiofiles
 import httpx
+from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File, Form
 from app.models.schemas import MatchCreate, MatchResponse, MatchStatus
 from app.services.mux_service import MuxService
@@ -54,7 +55,6 @@ async def upload_match(
 
     logger.info("Saved %s (%d MB) to %s", video.filename, total_size // (1024 * 1024), local_path)
 
-    # Create match record
     record = await db.insert("matches", {
         "id": match_id,
         "title": title,
@@ -64,9 +64,36 @@ async def upload_match(
         "status": MatchStatus.processing,
     })
 
-    # Process in background: Mux upload + TwelveLabs indexing
     background_tasks.add_task(process_video_pipeline, match_id, local_path, title, content_type)
+    return record
 
+
+class UrlUploadRequest(BaseModel):
+    video_url: str
+    title: str
+    opponent: str | None = None
+    formation: str | None = None
+    notes: str | None = None
+
+
+@router.post("/upload-url")
+async def upload_match_from_url(request: UrlUploadRequest, background_tasks: BackgroundTasks):
+    """Upload a match from a direct video URL (e.g. VEO download link).
+    Sends URL directly to Mux + TwelveLabs — no local file needed."""
+    match_id = str(uuid.uuid4())
+
+    record = await db.insert("matches", {
+        "id": match_id,
+        "title": request.title,
+        "opponent": request.opponent,
+        "formation": request.formation,
+        "notes": request.notes,
+        "status": MatchStatus.processing,
+    })
+
+    background_tasks.add_task(
+        process_url_pipeline, match_id, request.video_url, request.title
+    )
     return record
 
 
@@ -170,6 +197,88 @@ async def process_video_pipeline(match_id: str, local_path: str, title: str, con
             logger.info("Cleaned up local file for match %s", match_id)
         except OSError:
             pass
+
+
+async def process_url_pipeline(match_id: str, video_url: str, title: str):
+    """Background: ingest video from URL into Mux + TwelveLabs."""
+    try:
+        # Step 1: Create Mux asset from URL
+        logger.info("Creating Mux asset from URL for match %s", match_id)
+        asset = await mux.create_asset_from_url(video_url)
+        duration = asset.get("duration")
+
+        # Poll until Mux asset is ready
+        for _ in range(120):
+            asset = await mux.get_asset(asset["asset_id"])
+            if asset["status"] == "ready":
+                duration = asset.get("duration")
+                await db.update("matches", match_id, {
+                    "mux_asset_id": asset["asset_id"],
+                    "mux_playback_id": asset["playback_id"],
+                    "duration_seconds": duration,
+                    "thumbnail_url": asset.get("thumbnail_url"),
+                })
+                logger.info("Mux asset ready for match %s", match_id)
+                break
+            await asyncio.sleep(3)
+        else:
+            logger.warning("Mux asset polling timed out for match %s", match_id)
+
+        # Step 2: Index with TwelveLabs from URL
+        await db.update("matches", match_id, {"status": MatchStatus.indexing})
+
+        max_tl_duration = 3600  # TwelveLabs 60-min limit
+        if duration and duration > max_tl_duration:
+            logger.warning(
+                "Video is %d min — exceeds TwelveLabs 60-min limit. "
+                "Mux playback works, but AI analysis unavailable for now.",
+                int(duration // 60),
+            )
+            await db.update("matches", match_id, {
+                "status": MatchStatus.ready,
+                "error_message": f"Video is {int(duration // 60)} min — exceeds TwelveLabs 60-min limit. "
+                                 "Playback works but AI analysis is not available yet. "
+                                 "Split the video into halves for full analysis.",
+            })
+            return
+
+        result = await twelvelabs.index_video_from_url(video_url, title)
+        await db.update("matches", match_id, {
+            "twelvelabs_task_id": result["task_id"],
+            "twelvelabs_video_id": result.get("video_id"),
+        })
+        logger.info("TwelveLabs task submitted for match %s: %s", match_id, result["task_id"])
+
+        # Step 3: Poll TwelveLabs until ready
+        for _ in range(180):  # up to ~15 minutes
+            await asyncio.sleep(5)
+            task = await twelvelabs.get_task_status(result["task_id"])
+            if task["status"] == "ready":
+                await db.update("matches", match_id, {
+                    "status": MatchStatus.ready,
+                    "twelvelabs_video_id": task["video_id"],
+                })
+                logger.info("Match %s is READY", match_id)
+                return
+            elif task["status"] == "failed":
+                await db.update("matches", match_id, {
+                    "status": MatchStatus.failed,
+                    "error_message": "TwelveLabs indexing failed",
+                })
+                logger.error("TwelveLabs indexing failed for match %s", match_id)
+                return
+
+        await db.update("matches", match_id, {
+            "status": MatchStatus.failed,
+            "error_message": "TwelveLabs indexing timed out",
+        })
+
+    except Exception as e:
+        logger.exception("URL pipeline failed for match %s", match_id)
+        await db.update("matches", match_id, {
+            "status": MatchStatus.failed,
+            "error_message": str(e),
+        })
 
 
 @router.post("", response_model=MatchResponse)

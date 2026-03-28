@@ -38,6 +38,24 @@ class TwelveLabsService:
                 "status": data.get("status", "pending"),
             }
 
+    async def index_video_from_url(self, video_url: str, title: str = "") -> dict:
+        """Submit a video URL for indexing via multipart form. Returns task info."""
+        headers = {"x-api-key": self.api_key}
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{self.base_url}/tasks",
+                data={"index_id": self.index_id, "video_url": video_url},
+                files={"_": ("", b"")},  # forces multipart/form-data encoding
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "task_id": data["_id"],
+                "video_id": data.get("video_id"),
+                "status": data.get("status", "pending"),
+            }
+
     async def index_video(self, video_url: str, title: str = "") -> dict:
         """Submit a video URL for indexing. Returns task info."""
         headers = {"x-api-key": self.api_key}
