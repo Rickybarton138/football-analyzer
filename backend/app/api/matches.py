@@ -204,7 +204,7 @@ async def process_video_pipeline(match_id: str, local_path: str, title: str, con
 
 async def process_url_pipeline(match_id: str, video_url: str, title: str):
     """Background: download video, upload to Mux, split for TwelveLabs."""
-    from app.services.video_splitter import download_video, split_match, cleanup_files
+    from app.services.video_splitter import download_video, split_match, cleanup_files, get_video_duration
 
     local_path = os.path.join(UPLOAD_DIR, f"{match_id}_full.mp4")
     files_to_clean = [local_path]
@@ -216,61 +216,68 @@ async def process_url_pipeline(match_id: str, video_url: str, title: str):
         file_size = os.path.getsize(local_path)
         logger.info("Downloaded %.0f MB for match %s", file_size / (1024 * 1024), match_id)
 
-        # Step 2: Upload to Mux from local file (proven reliable)
-        logger.info("Uploading to Mux for match %s", match_id)
+        # Get duration from the file directly (don't rely on Mux for this)
+        duration = await get_video_duration(local_path)
+        logger.info("Video duration: %.0f sec (%.0f min) for match %s", duration, duration / 60, match_id)
+
+        # Step 2: Upload to Mux from local file using curl (reliable for large files)
+        logger.info("Uploading %.0f MB to Mux for match %s", file_size / (1024*1024), match_id)
         upload = await mux.create_upload()
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=30.0)) as client:
-            async def stream_file():
-                async with aiofiles.open(local_path, "rb") as f:
-                    while chunk := await f.read(4 * 1024 * 1024):
-                        yield chunk
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+            "--upload-file", local_path,
+            "-H", "Content-Type: video/mp4",
+            upload["upload_url"],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        http_code = stdout.decode().strip()[-3:]  # Last 3 chars are the HTTP code
+        logger.info("Mux curl upload returned HTTP %s for match %s", http_code, match_id)
 
-            resp = await client.put(
-                upload["upload_url"],
-                content=stream_file(),
-                headers={
-                    "Content-Type": "video/mp4",
-                    "Content-Length": str(file_size),
-                },
-            )
-            resp.raise_for_status()
+        if not http_code.startswith("2"):
+            logger.error("Mux upload failed with HTTP %s", http_code)
+            # Don't abort — continue with TwelveLabs, Mux can be retried
 
-        logger.info("Mux upload complete for match %s, polling for asset", match_id)
-
-        # Poll until Mux asset is ready
+        # Poll until Mux asset is ready (run in background, don't block TwelveLabs)
+        mux_ready = False
         asset_id = None
-        duration = None
-        for _ in range(180):
+        for _ in range(60):
             asset_id = await mux.get_asset_from_upload(upload["upload_id"])
             if asset_id:
                 break
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)
 
         if asset_id:
-            for _ in range(180):
+            for _ in range(120):
                 asset = await mux.get_asset(asset_id)
                 if asset["status"] == "ready":
-                    duration = asset.get("duration")
+                    mux_ready = True
                     await db.update("matches", match_id, {
                         "mux_asset_id": asset["asset_id"],
                         "mux_playback_id": asset["playback_id"],
                         "duration_seconds": duration,
                         "thumbnail_url": asset.get("thumbnail_url"),
                     })
-                    logger.info("Mux asset ready for match %s (%.0f min)", match_id, (duration or 0) / 60)
+                    logger.info("Mux asset ready for match %s", match_id)
                     break
                 if asset["status"] == "errored":
                     logger.error("Mux asset errored for match %s", match_id)
                     break
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
+
+        if not mux_ready:
+            logger.warning("Mux not ready for match %s — continuing with TwelveLabs anyway", match_id)
+            # Store duration even without Mux
+            await db.update("matches", match_id, {"duration_seconds": duration})
 
         # Step 3: Index with TwelveLabs
         await db.update("matches", match_id, {"status": MatchStatus.indexing})
 
         max_tl_duration = 3300  # 55 min
 
-        if duration and duration > max_tl_duration:
+        if duration > max_tl_duration:
             # Split into halves, skip halftime
             logger.info("Video is %d min — splitting for TwelveLabs", int(duration // 60))
             halves = await split_match(local_path, match_id)

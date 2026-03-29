@@ -21,8 +21,12 @@ class TwelveLabsService:
     async def index_video_from_file(self, file_path: str, title: str = "", content_type: str = "video/mp4") -> dict:
         """Upload a local video file for indexing. Returns task info."""
         import os
+        import logging
+        logger = logging.getLogger(__name__)
+        file_size = os.path.getsize(file_path)
+        logger.info("TwelveLabs uploading %s (%.0f MB, %s)", os.path.basename(file_path), file_size / (1024*1024), content_type)
         headers = {"x-api-key": self.api_key}
-        async with httpx.AsyncClient(timeout=600) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=30.0)) as client:
             with open(file_path, "rb") as f:
                 resp = await client.post(
                     f"{self.base_url}/tasks",
@@ -30,6 +34,8 @@ class TwelveLabsService:
                     files={"video_file": (os.path.basename(file_path), f, content_type)},
                     headers=headers,
                 )
+            if resp.status_code != 200:
+                logger.error("TwelveLabs upload failed %d: %s", resp.status_code, resp.text[:500])
             resp.raise_for_status()
             data = resp.json()
             return {
