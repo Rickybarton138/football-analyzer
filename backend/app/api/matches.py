@@ -257,54 +257,96 @@ async def process_url_pipeline(match_id: str, video_url: str, title: str):
         else:
             logger.warning("Mux upload->asset timed out for match %s", match_id)
 
-        # Step 2: Index with TwelveLabs from URL
+        # Step 2: Index with TwelveLabs
         await db.update("matches", match_id, {"status": MatchStatus.indexing})
 
-        max_tl_duration = 3600  # TwelveLabs 60-min limit
+        max_tl_duration = 3300  # 55 min (safe margin under 60-min free tier limit)
+
         if duration and duration > max_tl_duration:
-            logger.warning(
-                "Video is %d min — exceeds TwelveLabs 60-min limit. "
-                "Mux playback works, but AI analysis unavailable for now.",
-                int(duration // 60),
-            )
+            # Long video — download, split into halves (skip halftime), index both
+            from app.services.video_splitter import download_video, split_match, cleanup_files
+
+            logger.info("Video is %d min — splitting into halves for TwelveLabs", int(duration // 60))
+            local_path = os.path.join(UPLOAD_DIR, f"{match_id}_full.mp4")
+
+            try:
+                await download_video(video_url, local_path)
+                halves = await split_match(local_path, match_id)
+
+                video_ids = []
+                for half in halves:
+                    logger.info("Indexing %s for match %s", half["label"], match_id)
+                    result = await twelvelabs.index_video_from_file(
+                        half["path"],
+                        f"{title} - {half['label']}",
+                        "video/mp4",
+                    )
+                    # Poll until this half is indexed
+                    for _ in range(180):
+                        await asyncio.sleep(5)
+                        task = await twelvelabs.get_task_status(result["task_id"])
+                        if task["status"] == "ready":
+                            video_ids.append(task["video_id"])
+                            logger.info("%s indexed: %s", half["label"], task["video_id"])
+                            break
+                        elif task["status"] == "failed":
+                            logger.error("%s indexing failed", half["label"])
+                            break
+
+                if video_ids:
+                    # Store first half's video_id as primary (search works across whole index)
+                    await db.update("matches", match_id, {
+                        "status": MatchStatus.ready,
+                        "twelvelabs_video_id": video_ids[0],
+                        "twelvelabs_task_id": ",".join(video_ids),
+                    })
+                    logger.info("Match %s READY — %d halves indexed", match_id, len(video_ids))
+                else:
+                    await db.update("matches", match_id, {
+                        "status": MatchStatus.failed,
+                        "error_message": "Failed to index match halves",
+                    })
+            finally:
+                # Clean up all temp files
+                files_to_clean = [local_path]
+                files_to_clean.extend(
+                    os.path.join(UPLOAD_DIR, f)
+                    for f in os.listdir(UPLOAD_DIR)
+                    if f.startswith(match_id)
+                )
+                cleanup_files(*files_to_clean)
+        else:
+            # Short video — index directly from URL
+            result = await twelvelabs.index_video_from_url(video_url, title)
             await db.update("matches", match_id, {
-                "status": MatchStatus.ready,
-                "error_message": f"Video is {int(duration // 60)} min — exceeds TwelveLabs 60-min limit. "
-                                 "Playback works but AI analysis is not available yet. "
-                                 "Split the video into halves for full analysis.",
+                "twelvelabs_task_id": result["task_id"],
+                "twelvelabs_video_id": result.get("video_id"),
             })
-            return
+            logger.info("TwelveLabs task submitted for match %s: %s", match_id, result["task_id"])
 
-        result = await twelvelabs.index_video_from_url(video_url, title)
-        await db.update("matches", match_id, {
-            "twelvelabs_task_id": result["task_id"],
-            "twelvelabs_video_id": result.get("video_id"),
-        })
-        logger.info("TwelveLabs task submitted for match %s: %s", match_id, result["task_id"])
+            # Poll until ready
+            for _ in range(180):
+                await asyncio.sleep(5)
+                task = await twelvelabs.get_task_status(result["task_id"])
+                if task["status"] == "ready":
+                    await db.update("matches", match_id, {
+                        "status": MatchStatus.ready,
+                        "twelvelabs_video_id": task["video_id"],
+                    })
+                    logger.info("Match %s is READY", match_id)
+                    return
+                elif task["status"] == "failed":
+                    await db.update("matches", match_id, {
+                        "status": MatchStatus.failed,
+                        "error_message": "TwelveLabs indexing failed",
+                    })
+                    logger.error("TwelveLabs indexing failed for match %s", match_id)
+                    return
 
-        # Step 3: Poll TwelveLabs until ready
-        for _ in range(180):  # up to ~15 minutes
-            await asyncio.sleep(5)
-            task = await twelvelabs.get_task_status(result["task_id"])
-            if task["status"] == "ready":
-                await db.update("matches", match_id, {
-                    "status": MatchStatus.ready,
-                    "twelvelabs_video_id": task["video_id"],
-                })
-                logger.info("Match %s is READY", match_id)
-                return
-            elif task["status"] == "failed":
-                await db.update("matches", match_id, {
-                    "status": MatchStatus.failed,
-                    "error_message": "TwelveLabs indexing failed",
-                })
-                logger.error("TwelveLabs indexing failed for match %s", match_id)
-                return
-
-        await db.update("matches", match_id, {
-            "status": MatchStatus.failed,
-            "error_message": "TwelveLabs indexing timed out",
-        })
+            await db.update("matches", match_id, {
+                "status": MatchStatus.failed,
+                "error_message": "TwelveLabs indexing timed out",
+            })
 
     except Exception as e:
         logger.exception("URL pipeline failed for match %s", match_id)
