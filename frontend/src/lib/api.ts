@@ -35,6 +35,12 @@ export const api = {
   generateSessionPlan: (matchId: string, minutes?: number) =>
     request(`/analysis/session-plan?match_id=${matchId}&available_minutes=${minutes || 90}`, { method: 'POST' }),
 
+  // Conversational AI Coach
+  chat: (data: { match_id: string; messages: { role: string; content: string }[] }) =>
+    request<{ response: string; clips: any[]; tools_used: string[] }>(
+      '/analysis/chat', { method: 'POST', body: JSON.stringify(data) }
+    ),
+
   // Search
   searchFootage: (query: string, matchId?: string) =>
     request('/search', { method: 'POST', body: JSON.stringify({ query, match_id: matchId }) }),

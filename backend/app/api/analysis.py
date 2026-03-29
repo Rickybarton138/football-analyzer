@@ -1,5 +1,6 @@
-"""Analysis endpoints — tactical analysis, highlights, coaching advice."""
+"""Analysis endpoints — tactical analysis, highlights, coaching advice, chat."""
 
+from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from app.models.schemas import AnalysisRequest, AnalysisType
 from app.services.twelvelabs_service import TwelveLabsService
@@ -136,3 +137,39 @@ async def generate_session_plan(match_id: str, available_minutes: int = 90):
 
     plan = await coach.generate_session_plan(coaching_advice, available_minutes)
     return {"session_plan": plan, "based_on_match": match_id}
+
+
+# --- Conversational AI Coach ---
+
+class ChatMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
+class ChatRequest(BaseModel):
+    match_id: str
+    messages: list[ChatMessage]
+
+
+@router.post("/chat")
+async def chat_with_coach(request: ChatRequest):
+    """Conversational AI coaching — agentic loop with tool use.
+
+    Send the full conversation history. The coach can search video,
+    analyse moments, generate clips, and design drills during the conversation.
+    """
+    match = await db.select_one("matches", request.match_id)
+    if not match:
+        raise HTTPException(404, "Match not found")
+
+    # Convert to API format
+    messages = [{"role": m.role, "content": m.content} for m in request.messages]
+
+    result = await coach.chat(
+        messages=messages,
+        match_id=request.match_id,
+        video_id=match.get("twelvelabs_video_id"),
+        playback_id=match.get("mux_playback_id"),
+    )
+
+    return result
