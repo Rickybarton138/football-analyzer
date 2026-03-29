@@ -80,6 +80,9 @@ class UrlUploadRequest(BaseModel):
 async def upload_match_from_url(request: UrlUploadRequest, background_tasks: BackgroundTasks):
     """Upload a match from a direct video URL (e.g. VEO download link).
     Sends URL directly to Mux + TwelveLabs — no local file needed."""
+    url = request.video_url.strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        raise HTTPException(400, "URL must start with http:// or https://")
     match_id = str(uuid.uuid4())
 
     record = await db.insert("matches", {
@@ -92,7 +95,7 @@ async def upload_match_from_url(request: UrlUploadRequest, background_tasks: Bac
     })
 
     background_tasks.add_task(
-        process_url_pipeline, match_id, request.video_url, request.title
+        process_url_pipeline, match_id, url, request.title
     )
     return record
 
@@ -200,46 +203,52 @@ async def process_video_pipeline(match_id: str, local_path: str, title: str, con
 
 
 async def process_url_pipeline(match_id: str, video_url: str, title: str):
-    """Background: ingest video from URL into Mux + TwelveLabs."""
+    """Background: download video, upload to Mux, split for TwelveLabs."""
+    from app.services.video_splitter import download_video, split_match, cleanup_files
+
+    local_path = os.path.join(UPLOAD_DIR, f"{match_id}_full.mp4")
+    files_to_clean = [local_path]
+
     try:
-        # Step 1: Stream video from URL → Mux upload
-        logger.info("Streaming video from URL to Mux for match %s", match_id)
+        # Step 1: Download video locally
+        logger.info("Downloading video for match %s", match_id)
+        await download_video(video_url, local_path)
+        file_size = os.path.getsize(local_path)
+        logger.info("Downloaded %.0f MB for match %s", file_size / (1024 * 1024), match_id)
+
+        # Step 2: Upload to Mux from local file (proven reliable)
+        logger.info("Uploading to Mux for match %s", match_id)
         upload = await mux.create_upload()
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=30.0)) as client:
-            # Stream from source URL to Mux upload URL (proxy, no local file)
-            async with client.stream("GET", video_url) as source:
-                source.raise_for_status()
-                content_type = source.headers.get("content-type", "video/mp4")
-                content_length = source.headers.get("content-length", "")
-
-                async def relay():
-                    async for chunk in source.aiter_bytes(chunk_size=4 * 1024 * 1024):
+            async def stream_file():
+                async with aiofiles.open(local_path, "rb") as f:
+                    while chunk := await f.read(4 * 1024 * 1024):
                         yield chunk
 
-                resp = await client.put(
-                    upload["upload_url"],
-                    content=relay(),
-                    headers={
-                        "Content-Type": content_type,
-                        **({"Content-Length": content_length} if content_length else {}),
-                    },
-                )
-                resp.raise_for_status()
+            resp = await client.put(
+                upload["upload_url"],
+                content=stream_file(),
+                headers={
+                    "Content-Type": "video/mp4",
+                    "Content-Length": str(file_size),
+                },
+            )
+            resp.raise_for_status()
 
-        logger.info("Mux upload complete for match %s, waiting for asset", match_id)
+        logger.info("Mux upload complete for match %s, polling for asset", match_id)
 
         # Poll until Mux asset is ready
         asset_id = None
         duration = None
-        for _ in range(120):
+        for _ in range(180):
             asset_id = await mux.get_asset_from_upload(upload["upload_id"])
             if asset_id:
                 break
             await asyncio.sleep(3)
 
         if asset_id:
-            for _ in range(120):
+            for _ in range(180):
                 asset = await mux.get_asset(asset_id)
                 if asset["status"] == "ready":
                     duration = asset.get("duration")
@@ -249,82 +258,63 @@ async def process_url_pipeline(match_id: str, video_url: str, title: str):
                         "duration_seconds": duration,
                         "thumbnail_url": asset.get("thumbnail_url"),
                     })
-                    logger.info("Mux asset ready for match %s", match_id)
+                    logger.info("Mux asset ready for match %s (%.0f min)", match_id, (duration or 0) / 60)
+                    break
+                if asset["status"] == "errored":
+                    logger.error("Mux asset errored for match %s", match_id)
                     break
                 await asyncio.sleep(3)
-            else:
-                logger.warning("Mux asset polling timed out for match %s", match_id)
-        else:
-            logger.warning("Mux upload->asset timed out for match %s", match_id)
 
-        # Step 2: Index with TwelveLabs
+        # Step 3: Index with TwelveLabs
         await db.update("matches", match_id, {"status": MatchStatus.indexing})
 
-        max_tl_duration = 3300  # 55 min (safe margin under 60-min free tier limit)
+        max_tl_duration = 3300  # 55 min
 
         if duration and duration > max_tl_duration:
-            # Long video — download, split into halves (skip halftime), index both
-            from app.services.video_splitter import download_video, split_match, cleanup_files
+            # Split into halves, skip halftime
+            logger.info("Video is %d min — splitting for TwelveLabs", int(duration // 60))
+            halves = await split_match(local_path, match_id)
+            files_to_clean.extend(h["path"] for h in halves if h["path"] != local_path)
 
-            logger.info("Video is %d min — splitting into halves for TwelveLabs", int(duration // 60))
-            local_path = os.path.join(UPLOAD_DIR, f"{match_id}_full.mp4")
-
-            try:
-                await download_video(video_url, local_path)
-                halves = await split_match(local_path, match_id)
-
-                video_ids = []
-                for half in halves:
-                    logger.info("Indexing %s for match %s", half["label"], match_id)
-                    result = await twelvelabs.index_video_from_file(
-                        half["path"],
-                        f"{title} - {half['label']}",
-                        "video/mp4",
-                    )
-                    # Poll until this half is indexed
-                    for _ in range(180):
-                        await asyncio.sleep(5)
-                        task = await twelvelabs.get_task_status(result["task_id"])
-                        if task["status"] == "ready":
-                            video_ids.append(task["video_id"])
-                            logger.info("%s indexed: %s", half["label"], task["video_id"])
-                            break
-                        elif task["status"] == "failed":
-                            logger.error("%s indexing failed", half["label"])
-                            break
-
-                if video_ids:
-                    # Store first half's video_id as primary (search works across whole index)
-                    await db.update("matches", match_id, {
-                        "status": MatchStatus.ready,
-                        "twelvelabs_video_id": video_ids[0],
-                        "twelvelabs_task_id": ",".join(video_ids),
-                    })
-                    logger.info("Match %s READY — %d halves indexed", match_id, len(video_ids))
-                else:
-                    await db.update("matches", match_id, {
-                        "status": MatchStatus.failed,
-                        "error_message": "Failed to index match halves",
-                    })
-            finally:
-                # Clean up all temp files
-                files_to_clean = [local_path]
-                files_to_clean.extend(
-                    os.path.join(UPLOAD_DIR, f)
-                    for f in os.listdir(UPLOAD_DIR)
-                    if f.startswith(match_id)
+            video_ids = []
+            for half in halves:
+                logger.info("Indexing %s for match %s", half["label"], match_id)
+                result = await twelvelabs.index_video_from_file(
+                    half["path"],
+                    f"{title} - {half['label']}",
+                    "video/mp4",
                 )
-                cleanup_files(*files_to_clean)
+                for _ in range(180):
+                    await asyncio.sleep(5)
+                    task = await twelvelabs.get_task_status(result["task_id"])
+                    if task["status"] == "ready":
+                        video_ids.append(task["video_id"])
+                        logger.info("%s indexed: %s", half["label"], task["video_id"])
+                        break
+                    elif task["status"] == "failed":
+                        logger.error("%s indexing failed", half["label"])
+                        break
+
+            if video_ids:
+                await db.update("matches", match_id, {
+                    "status": MatchStatus.ready,
+                    "twelvelabs_video_id": video_ids[0],
+                    "twelvelabs_task_id": ",".join(video_ids),
+                })
+                logger.info("Match %s READY — %d halves indexed", match_id, len(video_ids))
+            else:
+                await db.update("matches", match_id, {
+                    "status": MatchStatus.failed,
+                    "error_message": "Failed to index match halves with TwelveLabs",
+                })
         else:
-            # Short video — index directly from URL
-            result = await twelvelabs.index_video_from_url(video_url, title)
+            # Short video — index the whole file
+            result = await twelvelabs.index_video_from_file(local_path, title, "video/mp4")
             await db.update("matches", match_id, {
                 "twelvelabs_task_id": result["task_id"],
                 "twelvelabs_video_id": result.get("video_id"),
             })
-            logger.info("TwelveLabs task submitted for match %s: %s", match_id, result["task_id"])
 
-            # Poll until ready
             for _ in range(180):
                 await asyncio.sleep(5)
                 task = await twelvelabs.get_task_status(result["task_id"])
@@ -340,7 +330,6 @@ async def process_url_pipeline(match_id: str, video_url: str, title: str):
                         "status": MatchStatus.failed,
                         "error_message": "TwelveLabs indexing failed",
                     })
-                    logger.error("TwelveLabs indexing failed for match %s", match_id)
                     return
 
             await db.update("matches", match_id, {
@@ -354,6 +343,13 @@ async def process_url_pipeline(match_id: str, video_url: str, title: str):
             "status": MatchStatus.failed,
             "error_message": str(e),
         })
+    finally:
+        files_to_clean.extend(
+            os.path.join(UPLOAD_DIR, f)
+            for f in os.listdir(UPLOAD_DIR)
+            if f.startswith(match_id)
+        )
+        cleanup_files(*files_to_clean)
 
 
 @router.post("", response_model=MatchResponse)

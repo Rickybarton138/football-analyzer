@@ -23,10 +23,21 @@ export default function MatchUpload() {
   const handleUrlUpload = useCallback(async () => {
     if (!videoUrl || !title) return;
     setError('');
+
+    // Ensure URL has protocol
+    let url = videoUrl.trim();
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      url = 'https://' + url;
+    }
+    if (!url.includes('.') || url.length < 10) {
+      setError('Please enter a valid video URL');
+      return;
+    }
+
     try {
       setStep('processing');
       const match: any = await api.uploadFromUrl({
-        video_url: videoUrl, title, opponent, formation, notes,
+        video_url: url, title, opponent, formation, notes,
       });
       setTimeout(() => navigate(`/match/${match.id}`), 1500);
     } catch (err: any) {
