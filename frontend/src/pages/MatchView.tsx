@@ -67,12 +67,21 @@ export default function MatchView() {
       {/* Video Player */}
       <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
         <div className="aspect-video bg-black">
+          {/* TODO: Generate chapters WebVTT from TwelveLabs analysis timestamps
+              (highlights_raw / tactical_raw contain key moment times) and pass as
+              <track kind="chapters" src={chaptersVttUrl} /> inside the player,
+              or use the `chapters` slot on MuxPlayer for native chapter markers. */}
           {m?.mux_playback_id ? (
             <MuxPlayer
               playbackId={m.mux_playback_id}
               streamType="on-demand"
               accentColor="#10b981"
               className="w-full h-full"
+              storyboard-src
+              playbackRates={[0.25, 0.5, 1, 1.5, 2]}
+              pip
+              forwardSeekOffset={10}
+              backwardSeekOffset={10}
             />
           ) : (
             <div className="w-full h-full flex items-center justify-center text-zinc-600">
