@@ -383,6 +383,30 @@ async def list_matches():
     return await db.select("matches")
 
 
+@router.get("/{match_id}/report")
+async def download_match_report(match_id: str):
+    """Generate and download a PDF match report."""
+    from fastapi.responses import Response
+    from app.services.pdf_report import generate_pdf
+
+    match = await db.select_one("matches", match_id)
+    if not match:
+        raise HTTPException(404, "Match not found")
+
+    analyses = await db.select("analyses", f"match_id=eq.{match_id}&status=eq.complete")
+    if not analyses:
+        raise HTTPException(400, "No completed analysis found. Run an analysis first.")
+
+    pdf_bytes = await generate_pdf(match, analyses)
+    filename = f"match-report-{match.get('title', 'report').replace(' ', '-').lower()}.pdf"
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/{match_id}")
 async def get_match(match_id: str):
     """Get a single match."""

@@ -2,9 +2,32 @@ import { useState, useRef } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
-import { Play, Brain, ClipboardList, Loader2, Users, AlertTriangle, Bot } from 'lucide-react';
+import { Play, Brain, ClipboardList, Loader2, Users, AlertTriangle, Bot, Download, FileText, Target, Shield, Eye } from 'lucide-react';
 import MuxPlayer from '@mux/mux-player-react';
 import CoachChat from '../components/CoachChat';
+
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8002/api';
+
+const SMART_PRESETS = [
+  {
+    label: 'Scout Opposition',
+    icon: Eye,
+    color: 'red',
+    prompt: 'Create a detailed scouting report of the opposition team. Identify their formation, playing style, strengths, weaknesses, key players, and how we should set up to exploit their vulnerabilities next time we face them.',
+  },
+  {
+    label: 'Our Game Model',
+    icon: Target,
+    color: 'emerald',
+    prompt: 'Carry out a detailed tactical analysis of our team to understand our game model. How do we build up from the back? What are our attacking patterns? How do we press? What shape do we take in and out of possession? Where are the gaps in our game model?',
+  },
+  {
+    label: 'Defensive Review',
+    icon: Shield,
+    color: 'blue',
+    prompt: 'Analyse our defensive performance in detail. Look at our shape, line height, pressing triggers, transition defending, set piece defending, and individual defensive errors. Rate our defensive solidity and suggest improvements.',
+  },
+];
 
 export default function MatchView() {
   const { id } = useParams<{ id: string }>();
@@ -189,6 +212,50 @@ export default function MatchView() {
                 Session Plan
               </button>
             </div>
+          </div>
+        )}
+
+        {/* Smart Analysis Presets + Export */}
+        {m?.status === 'ready' && (
+          <div className="flex flex-wrap items-center gap-3">
+            {SMART_PRESETS.map((preset) => (
+              <button
+                key={preset.label}
+                onClick={() => {
+                  setChatOpen(true);
+                  // Small delay to let chat open, then auto-send the preset
+                  setTimeout(() => {
+                    const chatInput = document.querySelector<HTMLInputElement>('[placeholder="Ask about the match..."]');
+                    if (chatInput) {
+                      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                      nativeInputValueSetter?.call(chatInput, preset.prompt);
+                      chatInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                  }, 300);
+                }}
+                className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-colors
+                  ${preset.color === 'red' ? 'bg-red-500/10 border border-red-500/20 text-red-400 hover:bg-red-500/20' : ''}
+                  ${preset.color === 'emerald' ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20' : ''}
+                  ${preset.color === 'blue' ? 'bg-blue-500/10 border border-blue-500/20 text-blue-400 hover:bg-blue-500/20' : ''}
+                `}
+              >
+                <preset.icon className="w-4 h-4" />
+                {preset.label}
+              </button>
+            ))}
+
+            {/* PDF Download */}
+            {latestAnalysis && (
+              <a
+                href={`${API_BASE}/matches/${id}/report`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium bg-zinc-800 border border-zinc-700 text-zinc-300 hover:bg-zinc-700 transition-colors ml-auto"
+              >
+                <FileText className="w-4 h-4" />
+                Download PDF Report
+              </a>
+            )}
           </div>
         )}
 
