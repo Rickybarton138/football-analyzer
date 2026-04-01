@@ -63,64 +63,45 @@ async def run_analysis_pipeline(
         update_data = {"status": "complete"}
         coach_line = f"\nCoach's additional context: {coach_context}" if coach_context else ""
 
-        # Build the right prompt based on analysis type
+        # Build prompt — keep concise for Gemini (long prompts cause refusals)
         if analysis_type == AnalysisType.full:
             prompt = (
-                "You are an expert football analyst. Provide a comprehensive match analysis covering:\n\n"
-                "SECTION 1 - KEY MOMENTS:\n"
-                "Identify every significant event: goals, shots, saves, tackles, fouls, counter-attacks, "
-                "set pieces, defensive errors. For each, state the approximate timestamp, what happened, "
-                "which team/player was involved, and why it matters tactically.\n\n"
-                "SECTION 2 - TACTICAL ANALYSIS:\n"
-                "Analyse both teams covering: formation and shape in/out of possession, "
-                "build-up play, pressing intensity and triggers, attacking patterns, "
-                "defensive transitions, set piece organisation, width and compactness.\n\n"
-                "SECTION 3 - TEAM COMPARISON:\n"
-                "Compare the two teams' strengths and weaknesses. "
-                "Who dominated possession? Who was more dangerous? "
-                "What were the key tactical battles?"
-                + coach_line
+                "You are an expert football analyst. Analyse this match footage. "
+                "Identify key moments with timestamps, describe the tactical setup of both teams, "
+                "and compare their strengths and weaknesses." + coach_line
             )
         elif analysis_type == AnalysisType.highlights:
             prompt = (
-                "Identify every key moment in this football match. For each moment provide: "
-                "1) Approximate timestamp 2) What happened (goal, shot, tackle, key pass, "
-                "defensive error, counter-attack, set piece) 3) Which team/player was involved "
-                "4) Why it matters tactically. Focus on moments a grassroots coach would "
-                "want to review with their team."
-                + coach_line
+                "You are an expert football analyst. Identify every key moment in this match "
+                "with timestamps. Include goals, shots, saves, tackles, fouls, counter-attacks, "
+                "set pieces, and defensive errors. State which team was involved and why it matters." + coach_line
             )
         elif analysis_type == AnalysisType.tactical:
             prompt = (
-                "Provide a detailed tactical analysis of this football match covering:\n"
-                "1. Formation and shape - how each team sets up in and out of possession\n"
-                "2. Build-up play - how they progress the ball from defence to attack\n"
-                "3. Pressing and defensive transitions - intensity, triggers, shape\n"
-                "4. Attacking patterns - width, combinations, final third entries\n"
-                "5. Set pieces - any notable patterns\n"
-                "6. Key weaknesses to exploit\n"
-                "7. Key strengths to reinforce"
-                + coach_line
+                "You are an expert football analyst. Provide a detailed tactical analysis of this match. "
+                "Cover formations, build-up play, pressing, attacking patterns, defensive shape, "
+                "and set pieces for both teams." + coach_line
             )
         elif analysis_type == AnalysisType.player_spotlight:
             prompt = (
-                "Identify each individual player visible in this football match. "
-                "For each player, describe: their jersey colour and number if visible, "
-                "their position, key moments they were involved in, "
-                "notable actions (good and bad), and an overall performance assessment."
-                + coach_line
+                "You are an expert football analyst. Identify each player visible in this match. "
+                "Describe their jersey colour and number if visible, position, key moments, "
+                "notable actions good and bad, and overall performance." + coach_line
             )
         else:
             prompt = f"Analyse this football match.{coach_line}"
 
         # Use Gemini for video analysis (no rate limits)
-        # Fall back to TwelveLabs if no Mux playback ID
-        if mux_playback_id:
-            logger.info("Using Gemini for analysis (match has Mux playback)")
-            raw_analysis = await gemini.analyse_match(mux_playback_id, prompt)
-        else:
-            logger.info("Falling back to TwelveLabs (no Mux playback)")
+        # Check for existing Gemini file URI, fall back to TwelveLabs
+        gemini_uri = gemini.get_active_file_uri()
+        if gemini_uri:
+            logger.info("Using Gemini (found active file: %s)", gemini_uri[:60])
+            raw_analysis = await gemini.analyse_with_file_uri(gemini_uri, prompt)
+        elif video_id:
+            logger.info("Falling back to TwelveLabs (no Gemini file)")
             raw_analysis = await twelvelabs.analyse_video(video_id, prompt)
+        else:
+            raise Exception("No video source available for analysis")
 
         if analysis_type == AnalysisType.player_spotlight:
             update_data["player_analysis_raw"] = raw_analysis

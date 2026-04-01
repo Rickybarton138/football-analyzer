@@ -1,10 +1,11 @@
 """Gemini video analysis service — analyses match footage directly.
 
 Uses Gemini 2.5 Flash for fast, cheap video analysis with no rate limits.
-TwelveLabs is kept for semantic search; Gemini handles all analysis prompts.
+Requires video to be uploaded to Gemini File API first (max 2GB per file).
 """
 
 import logging
+import time
 from google import genai
 from app.core.config import get_settings
 
@@ -14,68 +15,51 @@ logger = logging.getLogger(__name__)
 class GeminiService:
     def __init__(self):
         s = get_settings()
-        self.client = genai.Client(api_key=s.gemini_api_key)
+        self.client = genai.Client(
+            api_key=s.gemini_api_key,
+            http_options={"timeout": 600_000},  # 10 min timeout for long video analysis
+        )
         self.model = "gemini-2.5-flash"
 
-    async def analyse_video_url(self, video_url: str, prompt: str) -> str:
-        """Analyse a video from a Mux stream URL using Gemini."""
-        logger.info("Gemini analysing video with prompt: %s...", prompt[:80])
+    def upload_and_wait(self, file_path: str, display_name: str = "") -> str:
+        """Upload a video file to Gemini File API and wait until active.
 
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=[
-                genai.types.Content(
-                    parts=[
-                        genai.types.Part.from_uri(
-                            file_uri=video_url,
-                            mime_type="video/mp4",
-                        ),
-                        genai.types.Part.from_text(prompt),
-                    ]
-                )
-            ],
-        )
-
-        text = response.text or ""
-        logger.info("Gemini returned %d chars", len(text))
-        return text
-
-    async def analyse_video_file(self, file_path: str, prompt: str) -> str:
-        """Analyse a local video file using Gemini.
-
-        Uploads the file to Gemini's File API first, then analyses it.
+        Returns the file URI (e.g. https://generativelanguage.googleapis.com/v1beta/files/xxx).
         """
-        import os
-        logger.info("Uploading %s to Gemini File API...", os.path.basename(file_path))
+        logger.info("Uploading %s to Gemini File API...", file_path)
+        uploaded = self.client.files.upload(
+            file=file_path,
+            config={"display_name": display_name} if display_name else None,
+        )
+        logger.info("Gemini file: %s (state: %s)", uploaded.name, uploaded.state)
 
-        # Upload file to Gemini
-        uploaded = self.client.files.upload(file=file_path)
-        logger.info("Uploaded to Gemini: %s (state: %s)", uploaded.name, uploaded.state)
-
-        # Wait for processing if needed
-        import time
         while uploaded.state.name == "PROCESSING":
             time.sleep(5)
             uploaded = self.client.files.get(name=uploaded.name)
-            logger.info("Gemini file state: %s", uploaded.state)
 
-        if uploaded.state.name == "FAILED":
-            raise Exception(f"Gemini file processing failed: {uploaded.name}")
+        if uploaded.state.name != "ACTIVE":
+            raise Exception(f"Gemini file failed: {uploaded.state.name}")
 
-        # Analyse
+        logger.info("Gemini file active: %s", uploaded.uri)
+        return uploaded.uri
+
+    def get_active_file_uri(self, display_name: str = "") -> str | None:
+        """Find an existing active file by display name."""
+        for f in self.client.files.list():
+            if f.state.name == "ACTIVE":
+                if not display_name or (f.display_name and display_name in f.display_name):
+                    return f.uri
+        return None
+
+    async def analyse_with_file_uri(self, file_uri: str, prompt: str) -> str:
+        """Analyse a video that's already uploaded to Gemini File API."""
         logger.info("Gemini analysing with prompt: %s...", prompt[:80])
+
         response = self.client.models.generate_content(
             model=self.model,
             contents=[
-                genai.types.Content(
-                    parts=[
-                        genai.types.Part.from_uri(
-                            file_uri=uploaded.uri,
-                            mime_type=uploaded.mime_type,
-                        ),
-                        genai.types.Part.from_text(prompt),
-                    ]
-                )
+                genai.types.Part.from_uri(file_uri=file_uri, mime_type="video/mp4"),
+                prompt,  # Pass as raw string, not Part.from_text()
             ],
         )
 
@@ -83,10 +67,7 @@ class GeminiService:
         logger.info("Gemini returned %d chars", len(text))
         return text
 
-    async def analyse_match(self, mux_playback_id: str, prompt: str) -> str:
-        """Analyse a match using its Mux HLS stream URL.
-
-        Gemini can process HLS streams directly — no download needed.
-        """
-        stream_url = f"https://stream.mux.com/{mux_playback_id}.m3u8"
-        return await self.analyse_video_url(stream_url, prompt)
+    async def analyse_video_file(self, file_path: str, prompt: str, display_name: str = "") -> str:
+        """Upload a video file and analyse it. Full pipeline."""
+        file_uri = self.upload_and_wait(file_path, display_name)
+        return await self.analyse_with_file_uri(file_uri, prompt)
