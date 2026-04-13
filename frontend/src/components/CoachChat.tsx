@@ -22,9 +22,10 @@ interface CoachChatProps {
   isOpen: boolean;
   onClose: () => void;
   onSeekTo?: (time: number) => void;
+  onPlayClip?: (start: number, end: number) => void;
 }
 
-export default function CoachChat({ matchId, isOpen, onClose, onSeekTo }: CoachChatProps) {
+export default function CoachChat({ matchId, isOpen, onClose, onSeekTo, onPlayClip }: CoachChatProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -126,7 +127,7 @@ export default function CoachChat({ matchId, isOpen, onClose, onSeekTo }: CoachC
                   {msg.clips.map((clip, j) => (
                     <button
                       key={j}
-                      onClick={() => onSeekTo?.(clip.start)}
+                      onClick={() => onPlayClip ? onPlayClip(clip.start, clip.end) : onSeekTo?.(clip.start)}
                       className="w-full flex items-center gap-3 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700 rounded-lg p-2 transition-colors text-left"
                     >
                       <div className="w-16 h-10 bg-zinc-700 rounded overflow-hidden flex-shrink-0">

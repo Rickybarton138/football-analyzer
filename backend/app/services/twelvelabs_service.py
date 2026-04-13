@@ -1,5 +1,6 @@
 """TwelveLabs video intelligence service — index, analyse, search."""
 
+import json
 import httpx
 from app.core.config import get_settings
 
@@ -34,9 +35,9 @@ class TwelveLabsService:
                     files={"video_file": (os.path.basename(file_path), f, content_type)},
                     headers=headers,
                 )
-            if resp.status_code != 200:
+            if resp.status_code not in (200, 201):
                 logger.error("TwelveLabs upload failed %d: %s", resp.status_code, resp.text[:500])
-            resp.raise_for_status()
+                resp.raise_for_status()
             data = resp.json()
             return {
                 "task_id": data["_id"],
@@ -151,19 +152,19 @@ class TwelveLabsService:
 
     async def search_moments(self, query: str, match_video_id: str | None = None) -> list[dict]:
         """Search for specific moments across indexed videos."""
-        payload = {
-            "index_id": self.index_id,
-            "query_text": query,
-            "search_options": ["visual", "conversation"],
-        }
+        fields = [
+            ("index_id", (None, self.index_id)),
+            ("query_text", (None, query)),
+            ("search_options", (None, "visual")),
+        ]
         if match_video_id:
-            payload["filter"] = {"id": [match_video_id]}
+            fields.append(("filter", (None, json.dumps({"id": [match_video_id]}))))
 
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 f"{self.base_url}/search",
-                json=payload,
-                headers=self.headers,
+                files=fields,
+                headers={"x-api-key": self.api_key},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -173,7 +174,7 @@ class TwelveLabsService:
                     "video_id": item["video_id"],
                     "start": item["start"],
                     "end": item["end"],
-                    "confidence": item["confidence"],
+                    "confidence": item.get("confidence", item.get("rank", 0)),
                     "metadata": item.get("metadata", {}),
                 })
             return results

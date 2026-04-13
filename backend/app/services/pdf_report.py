@@ -30,6 +30,10 @@ class MatchReportPDF(FPDF):
         super().__init__()
         self.set_auto_page_break(auto=True, margin=20)
 
+    def _safe(self, text: str) -> str:
+        """Ensure text is safe for Helvetica (latin-1 only)."""
+        return sanitize(text)
+
     def header(self):
         self.set_font("Helvetica", "B", 8)
         self.set_text_color(156, 163, 175)
@@ -99,31 +103,31 @@ class MatchReportPDF(FPDF):
             if stripped.startswith("### "):
                 self.set_font("Helvetica", "B", 10)
                 self.set_text_color(80, 80, 80)
-                self.multi_cell(0, 6, stripped[4:], new_x="LMARGIN", new_y="NEXT")
+                self.multi_cell(0, 6, self._safe(stripped[4:]), new_x="LMARGIN", new_y="NEXT")
                 self.set_font("Helvetica", "", 10)
                 self.set_text_color(40, 40, 40)
             elif stripped.startswith("## "):
                 self.set_font("Helvetica", "B", 11)
                 self.set_text_color(6, 78, 59)
-                self.multi_cell(0, 6, stripped[3:], new_x="LMARGIN", new_y="NEXT")
+                self.multi_cell(0, 6, self._safe(stripped[3:]), new_x="LMARGIN", new_y="NEXT")
                 self.set_font("Helvetica", "", 10)
                 self.set_text_color(40, 40, 40)
             elif stripped.startswith("# "):
                 self.set_font("Helvetica", "B", 12)
                 self.set_text_color(6, 78, 59)
-                self.multi_cell(0, 7, stripped[2:], new_x="LMARGIN", new_y="NEXT")
+                self.multi_cell(0, 7, self._safe(stripped[2:]), new_x="LMARGIN", new_y="NEXT")
                 self.set_font("Helvetica", "", 10)
                 self.set_text_color(40, 40, 40)
             elif stripped.startswith("- ") or stripped.startswith("* "):
                 clean = re.sub(r'\*\*(.+?)\*\*', r'\1', stripped[2:])
-                self.cell(6, 6, chr(8226))
-                self.multi_cell(0, 6, f" {clean}", new_x="LMARGIN", new_y="NEXT")
+                self.cell(6, 6, "-")
+                self.multi_cell(0, 6, self._safe(f" {clean}"), new_x="LMARGIN", new_y="NEXT")
             elif re.match(r'^\d+\.', stripped):
                 clean = re.sub(r'\*\*(.+?)\*\*', r'\1', stripped)
-                self.multi_cell(0, 6, clean, new_x="LMARGIN", new_y="NEXT")
+                self.multi_cell(0, 6, self._safe(clean), new_x="LMARGIN", new_y="NEXT")
             else:
                 clean = re.sub(r'\*\*(.+?)\*\*', r'\1', stripped)
-                self.multi_cell(0, 6, clean, new_x="LMARGIN", new_y="NEXT")
+                self.multi_cell(0, 6, self._safe(clean), new_x="LMARGIN", new_y="NEXT")
 
         self.ln(6)
 
@@ -149,29 +153,39 @@ async def generate_pdf(match: dict, analyses: list[dict]) -> bytes:
 
     pdf.add_title_block(title, opponent, formation, duration_str, date_str)
 
-    # Extract sections from analyses
-    coaching_advice = ""
+    # Extract sections by analysis type
+    our_team = ""
+    opposition = ""
     tactical_raw = ""
     highlights_raw = ""
     player_analysis = ""
+    coaching_advice = ""
 
     for a in analyses:
         if a.get("status") != "complete":
             continue
-        if a.get("coaching_advice") and not coaching_advice:
-            coaching_advice = a["coaching_advice"]
-        if a.get("tactical_raw") and not tactical_raw:
-            tactical_raw = a["tactical_raw"]
-        if a.get("highlights_raw") and not highlights_raw:
+        atype = a.get("analysis_type", "")
+        if atype == "our_team" and a.get("coaching_advice") and not our_team:
+            our_team = a["coaching_advice"]
+        elif atype == "opposition" and a.get("highlights_raw") and not opposition:
+            opposition = a["highlights_raw"]
+        elif atype == "tactical" and not tactical_raw:
+            tactical_raw = a.get("tactical_raw") or a.get("coaching_advice") or ""
+        elif atype == "highlights" and a.get("highlights_raw") and not highlights_raw:
             highlights_raw = a["highlights_raw"]
-        if a.get("player_analysis_raw") and not player_analysis:
+        elif atype == "player_spotlight" and a.get("player_analysis_raw") and not player_analysis:
             player_analysis = a["player_analysis_raw"]
+        # Legacy full analysis
+        if atype == "full" and a.get("coaching_advice") and not coaching_advice:
+            coaching_advice = a["coaching_advice"]
 
     # Add sections with brand colors
-    pdf.add_section("Coaching Insights", coaching_advice, (6, 78, 59))      # emerald
-    pdf.add_section("Tactical Analysis", tactical_raw, (30, 64, 120))       # blue
-    pdf.add_section("Key Moments", highlights_raw, (120, 53, 15))           # amber
-    pdf.add_section("Player Analysis", player_analysis, (22, 78, 99))       # cyan
+    pdf.add_section("Our Team Report", our_team, (6, 78, 59))              # emerald
+    pdf.add_section("Opposition Scouting Report", opposition, (120, 30, 30))  # red
+    pdf.add_section("Coaching Insights", coaching_advice, (6, 78, 59))     # emerald (legacy)
+    pdf.add_section("Tactical Analysis", tactical_raw, (30, 64, 120))      # blue
+    pdf.add_section("Key Moments", highlights_raw, (120, 53, 15))          # amber
+    pdf.add_section("Player Analysis", player_analysis, (22, 78, 99))      # cyan
 
     # Output
     buf = io.BytesIO()

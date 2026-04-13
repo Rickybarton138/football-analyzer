@@ -21,6 +21,8 @@ export const api = {
   listMatches: () => request<any[]>('/matches'),
   getMatch: (matchId: string) => request(`/matches/${matchId}`),
   getMatchStatus: (matchId: string) => request(`/matches/${matchId}/status`),
+  updateMatch: (matchId: string, data: Record<string, string>) =>
+    request(`/matches/${matchId}`, { method: 'PATCH', body: JSON.stringify(data) }),
 
   // Analysis
   runAnalysis: (data: { match_id: string; analysis_type?: string; prompt?: string }) =>
@@ -34,6 +36,12 @@ export const api = {
 
   generateSessionPlan: (matchId: string, minutes?: number) =>
     request(`/analysis/session-plan?match_id=${matchId}&available_minutes=${minutes || 90}`, { method: 'POST' }),
+
+  autoAnnotate: (data: { match_id: string; timestamp_sec: number; frame_base64: string }) =>
+    request<{ coaching_point: string; detail: string; annotations: any[]; match_id: string; timestamp_sec: number }>(
+      '/analysis/auto-annotate',
+      { method: 'POST', body: JSON.stringify(data) },
+    ),
 
   // Conversational AI Coach
   chat: (data: { match_id: string; messages: { role: string; content: string }[] }) =>

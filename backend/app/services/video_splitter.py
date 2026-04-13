@@ -20,17 +20,39 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 async def download_video(url: str, output_path: str) -> None:
-    """Download a video from URL to a local file."""
+    """Download a video from URL to a local file.
+
+    Validates the response looks like a video (Content-Type + size) so callers
+    get a clear error instead of a cryptic ffprobe failure later.
+    """
     import httpx
     logger.info("Downloading video to %s", output_path)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=30.0)) as client:
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(1800.0, connect=30.0),
+        follow_redirects=True,
+    ) as client:
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()
+            ctype = (resp.headers.get("content-type") or "").lower().split(";")[0].strip()
+            if ctype and not (ctype.startswith("video/") or ctype == "application/octet-stream"):
+                raise ValueError(
+                    f"URL did not return a video file (Content-Type: {ctype or 'unknown'}). "
+                    "This usually means the link points to a web page (e.g. a VEO share page "
+                    "or YouTube watch page), not a direct video download. "
+                    "Use the platform's 'Download' button and copy the resulting direct .mp4 link."
+                )
             with open(output_path, "wb") as f:
                 async for chunk in resp.aiter_bytes(chunk_size=4 * 1024 * 1024):
                     f.write(chunk)
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    logger.info("Downloaded %.0f MB to %s", size_mb, output_path)
+
+    size = os.path.getsize(output_path)
+    size_mb = size / (1024 * 1024)
+    logger.info("Downloaded %.0f MB (%d bytes) to %s", size_mb, size, output_path)
+    if size < 1024 * 1024:  # < 1 MB → almost certainly not a real video
+        raise ValueError(
+            f"Downloaded file is only {size} bytes — likely an error page or expired link, "
+            "not a real video. Check the URL opens the video directly in a private browser window."
+        )
 
 
 async def get_video_duration(file_path: str) -> float:
@@ -43,8 +65,20 @@ async def get_video_duration(file_path: str) -> float:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, _ = await proc.communicate()
-    return float(stdout.decode().strip())
+    stdout, stderr = await proc.communicate()
+    raw = stdout.decode().strip()
+    if not raw:
+        err = stderr.decode().strip()[:300] or "ffprobe returned no duration"
+        size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+        raise ValueError(
+            f"ffprobe could not read video at {os.path.basename(file_path)} "
+            f"(size={size} bytes) — file is not a valid video format. "
+            f"ffprobe stderr: {err}"
+        )
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(f"ffprobe returned unexpected duration output: {raw!r}")
 
 
 async def detect_halftime(file_path: str, duration: float) -> tuple[float, float]:
@@ -128,11 +162,39 @@ async def detect_halftime(file_path: str, duration: float) -> tuple[float, float
     return (ht_start, ht_end)
 
 
+async def _extract_segment(
+    file_path: str, out_path: str, start: float, end: float, label: str,
+) -> dict | None:
+    """Extract a segment from a video file using ffmpeg (no re-encoding)."""
+    duration = end - start
+    logger.info("Extracting %s: %.0f-%.0f sec (%.0f min)", label, start, end, duration / 60)
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", file_path,
+        "-ss", str(int(start)),
+        "-t", str(int(duration)),
+        "-c", "copy",
+        out_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return {"path": out_path, "label": label, "start": start, "end": end}
+    logger.error("Failed to extract %s", label)
+    return None
+
+
 async def split_match(
     file_path: str,
     match_id: str,
 ) -> list[dict]:
-    """Split a match video into halves, skipping halftime.
+    """Split a match video into 4 quarters, skipping halftime.
+
+    For a typical VEO recording (~114 min):
+      Q1: 0 → half1_mid
+      Q2: half1_mid → halftime_start
+      Q3: halftime_end → half2_mid
+      Q4: half2_mid → end
 
     Returns list of dicts: [{"path": str, "label": str, "start": float, "end": float}, ...]
     """
@@ -147,52 +209,33 @@ async def split_match(
     # Detect halftime
     ht_start, ht_end = await detect_halftime(file_path, duration)
 
-    halves = []
     base_dir = os.path.dirname(file_path)
     ext = os.path.splitext(file_path)[1]
 
-    # First half: 0 to halftime_start
-    h1_path = os.path.join(base_dir, f"{match_id}_h1{ext}")
-    logger.info("Extracting first half: 0 - %.0f sec", ht_start)
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", file_path,
-        "-t", str(int(ht_start)),
-        "-c", "copy",  # No re-encoding = fast
-        h1_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    await proc.communicate()
-    if os.path.exists(h1_path) and os.path.getsize(h1_path) > 0:
-        halves.append({
-            "path": h1_path,
-            "label": "First Half",
-            "start": 0,
-            "end": ht_start,
-        })
+    # Calculate quarter boundaries
+    h1_mid = ht_start / 2
+    h2_mid = ht_end + (duration - ht_end) / 2
 
-    # Second half: halftime_end to end
-    h2_path = os.path.join(base_dir, f"{match_id}_h2{ext}")
-    logger.info("Extracting second half: %.0f - %.0f sec", ht_end, duration)
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", file_path,
-        "-ss", str(int(ht_end)),
-        "-c", "copy",
-        h2_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    await proc.communicate()
-    if os.path.exists(h2_path) and os.path.getsize(h2_path) > 0:
-        halves.append({
-            "path": h2_path,
-            "label": "Second Half",
-            "start": ht_end,
-            "end": duration,
-        })
+    segments = [
+        (f"{match_id}_q1{ext}", 0, h1_mid, "Q1"),
+        (f"{match_id}_q2{ext}", h1_mid, ht_start, "Q2"),
+        (f"{match_id}_q3{ext}", ht_end, h2_mid, "Q3"),
+        (f"{match_id}_q4{ext}", h2_mid, duration, "Q4"),
+    ]
 
-    logger.info("Split into %d halves", len(halves))
-    return halves
+    logger.info("Splitting into 4 quarters (halftime %.0f-%.0f skipped)", ht_start, ht_end)
+
+    # Extract all quarters in parallel
+    tasks = []
+    for filename, start, end, label in segments:
+        out_path = os.path.join(base_dir, filename)
+        tasks.append(_extract_segment(file_path, out_path, start, end, label))
+
+    results = await asyncio.gather(*tasks)
+    quarters = [r for r in results if r is not None]
+
+    logger.info("Split into %d quarters", len(quarters))
+    return quarters
 
 
 def cleanup_files(*paths: str) -> None:

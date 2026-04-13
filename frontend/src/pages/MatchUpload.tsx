@@ -24,8 +24,13 @@ export default function MatchUpload() {
     if (!videoUrl || !title) return;
     setError('');
 
-    // Ensure URL has protocol
+    // Detect local file paths pasted into URL field
     let url = videoUrl.trim();
+    if (url.match(/^[A-Z]:\\|^\/Users|^~\/|^\.\//) || url.includes('\\')) {
+      setError('That looks like a local file path. Switch to "File Upload" mode to upload from your computer.');
+      return;
+    }
+    // Ensure URL has protocol
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
       url = 'https://' + url;
     }
@@ -228,7 +233,7 @@ export default function MatchUpload() {
         <div className="text-center py-12">
           <Loader2 className="w-12 h-12 text-blue-400 animate-spin mx-auto mb-4" />
           <h3 className="text-xl font-medium">Processing & Indexing...</h3>
-          <p className="text-zinc-400 mt-2">TwelveLabs is analysing your footage. This may take a few minutes.</p>
+          <p className="text-zinc-400 mt-2">Gemini is analysing your footage. This may take a few minutes.</p>
         </div>
       )}
     </div>

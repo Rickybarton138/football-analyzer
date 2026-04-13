@@ -1,15 +1,14 @@
 """Claude AI coaching service — agentic loop with tool use.
 
-Manager Mentor: a conversational AI assistant manager that can search match
-video, look up player stats, generate clips, and design training sessions —
-all while maintaining a natural coaching conversation.
+Manager Mentor: a conversational AI assistant manager that searches the stored
+Gemini match analysis, looks up player stats, generates Mux clips, and designs
+training sessions — all while maintaining a natural coaching conversation.
 """
 
 import json
 import logging
 import anthropic
 from app.core.config import get_settings
-from app.services.twelvelabs_service import TwelveLabsService
 from app.services.supabase_service import SupabaseService
 from app.services.mux_service import MuxService
 
@@ -46,20 +45,20 @@ RULES:
 TOOLS = [
     {
         "name": "search_match_video",
-        "description": "Search for specific moments in the match video using natural language. Returns timestamped clips. Use this when the coach asks about specific events, or when you want to reference a particular moment to support your advice.",
+        "description": "Search the stored tactical analysis of this match for passages relevant to a specific query. Returns matching passages with any timestamps Gemini recorded. Use this when the coach asks about specific events or when you want to ground your advice in particular moments of the match.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Natural language search query, e.g. 'counter-attack leading to goal', 'goalkeeper distribution', 'defensive shape at set pieces'"
+                    "description": "Natural language query, e.g. 'counter-attack leading to goal', 'goalkeeper distribution', 'defensive shape at set pieces'"
                 },
-                "video_id": {
+                "match_id": {
                     "type": "string",
-                    "description": "The TwelveLabs video ID to search within"
+                    "description": "The match ID whose analysis to search"
                 }
             },
-            "required": ["query", "video_id"]
+            "required": ["query", "match_id"]
         }
     },
     {
@@ -92,20 +91,20 @@ TOOLS = [
     },
     {
         "name": "analyse_video_moment",
-        "description": "Ask TwelveLabs to analyse a specific aspect of the video with a custom prompt. Use this for deep-dive questions the pre-built analysis doesn't cover.",
+        "description": "Drill into a specific aspect of the match by asking a custom question about the stored tactical analysis. Use for deep-dive questions the pre-built analysis doesn't directly cover.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "video_id": {
+                "match_id": {
                     "type": "string",
-                    "description": "The TwelveLabs video ID"
+                    "description": "The match ID to drill into"
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Specific analysis prompt, e.g. 'How does the defensive line hold its shape when the opposition play long balls?'"
+                    "description": "Specific analysis question, e.g. 'How does the defensive line hold its shape when the opposition play long balls?'"
                 }
             },
-            "required": ["video_id", "prompt"]
+            "required": ["match_id", "prompt"]
         }
     },
     {
@@ -175,21 +174,49 @@ class CoachAI:
         s = get_settings()
         self.client = anthropic.AsyncAnthropic(api_key=s.anthropic_api_key)
         self.model = s.ai_model
-        self.twelvelabs = TwelveLabsService()
         self.db = SupabaseService()
         self.mux = MuxService()
+
+    async def _load_match_analysis_corpus(self, match_id: str) -> str:
+        """Concatenate all completed tactical_raw rows for a match into one search corpus."""
+        rows = await self.db.select(
+            "analyses",
+            f"match_id=eq.{match_id}&status=eq.complete",
+        )
+        passages = [r.get("tactical_raw") or "" for r in rows]
+        return "\n\n---\n\n".join(p for p in passages if p.strip())
 
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> str:
         """Execute a tool call and return the result as a string."""
         try:
             if tool_name == "search_match_video":
-                results = await self.twelvelabs.search_moments(
-                    tool_input["query"],
-                    tool_input.get("video_id"),
+                match_id = tool_input.get("match_id") or tool_input.get("video_id")
+                if not match_id:
+                    return "Error: match_id is required."
+                query = tool_input["query"]
+                corpus = await self._load_match_analysis_corpus(match_id)
+                if not corpus:
+                    return "No tactical analysis available for this match yet."
+
+                search_resp = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1500,
+                    system=(
+                        "You are a search tool over a football match tactical analysis. "
+                        "Given a query and the full analysis text, return the 3-5 most relevant passages. "
+                        "For each match, include any timestamps or time ranges mentioned in the source text, "
+                        "and a brief 1-sentence context. Format as a JSON array:\n"
+                        '[{"timestamp": "~23 min", "passage": "Right-back pushes too high leaving space..."}]\n'
+                        "If the source text doesn't mention timestamps for a passage, use null. "
+                        "If nothing matches, return an empty array []. "
+                        "Only output JSON — no other text."
+                    ),
+                    messages=[{
+                        "role": "user",
+                        "content": f"QUERY: {query}\n\nMATCH ANALYSIS:\n{corpus[:30000]}",
+                    }],
                 )
-                if not results:
-                    return "No matching moments found for that query."
-                return json.dumps(results, default=str)
+                return search_resp.content[0].text
 
             elif tool_name == "get_match_analysis":
                 analyses = await self.db.select(
@@ -207,11 +234,30 @@ class CoachAI:
                 return json.dumps(match, default=str)
 
             elif tool_name == "analyse_video_moment":
-                result = await self.twelvelabs.analyse_video(
-                    tool_input["video_id"],
-                    tool_input["prompt"],
+                match_id = tool_input.get("match_id") or tool_input.get("video_id")
+                if not match_id:
+                    return "Error: match_id is required."
+                corpus = await self._load_match_analysis_corpus(match_id)
+                if not corpus:
+                    return "No tactical analysis available for this match yet."
+
+                resp = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1500,
+                    system=(
+                        "You are an expert football analyst answering a specific question "
+                        "about a match, grounded in the prior tactical analysis provided. "
+                        "Be specific, reference timestamps where the analysis mentions them, "
+                        "and do not invent events the analysis doesn't describe. "
+                        "Do NOT mention yellow/red cards or exact scorelines — the source "
+                        "analysis is known to hallucinate those."
+                    ),
+                    messages=[{
+                        "role": "user",
+                        "content": f"QUESTION: {tool_input['prompt']}\n\nANALYSIS DATA:\n{corpus[:30000]}",
+                    }],
                 )
-                return result
+                return resp.content[0].text
 
             elif tool_name == "create_video_clip":
                 clip_url = self.mux.get_clip_url(
@@ -272,34 +318,55 @@ class CoachAI:
         self,
         messages: list[dict],
         match_id: str | None = None,
-        video_id: str | None = None,
         playback_id: str | None = None,
+        our_name: str = "Our Team",
+        opp_name: str = "Opposition",
+        our_color: str = "",
+        opp_color: str = "",
+        **_ignored,
     ) -> dict:
         """Run the agentic coaching conversation loop.
 
         Args:
             messages: Conversation history [{role, content}, ...]
-            match_id: Current match ID (injected into system context)
-            video_id: TwelveLabs video ID for the current match
+            match_id: Current match ID — used by search/analyse tools to load tactical_raw
             playback_id: Mux playback ID for clip generation
+            our_name / opp_name / our_color / opp_color: team identity for mapping the
+                color-based Gemini analysis back to real team names
+
+        **_ignored swallows legacy kwargs (e.g. video_id) so older callers don't break.
 
         Returns:
             {response: str, clips: [...], tools_used: [...]}
         """
-        # Build system prompt with match context
+        # Build system prompt with match context + team identity
         system = COACHING_PERSONA
         if match_id:
             system += f"\n\nCURRENT MATCH CONTEXT:\n- Match ID: {match_id}"
-        if video_id:
-            system += f"\n- TwelveLabs Video ID: {video_id}"
+            system += (
+                "\n\nYou have access to this match's tactical analysis. Use the "
+                "search_match_video and analyse_video_moment tools to find specific "
+                "moments or drill into questions — both search the stored Gemini "
+                "analysis for this match_id. When relevant timestamps exist, use "
+                "create_video_clip with the playback ID to generate watchable links."
+            )
         if playback_id:
             system += f"\n- Mux Playback ID: {playback_id}"
-        if video_id:
+
+        if our_color and opp_color:
             system += (
-                "\n\nYou have access to this match's video. Use the search and analysis "
-                "tools to find specific moments when the coach asks about them. "
-                "When you find relevant clips, use create_video_clip to generate "
-                "watchable links the coach can click."
+                "\n\n*** CRITICAL — TEAM IDENTIFICATION ***"
+                f"\nThe {our_color.upper()} team in the video is {our_name} — this is OUR team (the coached team)."
+                f"\nThe {opp_color.upper()} team in the video is {opp_name} — this is the OPPOSITION."
+                f"\nWhenever tool results mention '{our_color.capitalize()} Team' or '{our_color}' kit, that is {our_name} (US)."
+                f"\nWhenever tool results mention '{opp_color.capitalize()} Team' or '{opp_color}' kit, that is {opp_name} (THEM)."
+                "\nDo NOT confuse the two. This mapping is definitive — the raw analysis text uses kit colours, you must translate."
+                "\n***"
+            )
+            system += (
+                "\n\nIMPORTANT: The source tactical analysis is known to hallucinate "
+                "disciplinary events. Do not mention yellow cards, red cards, sendings "
+                "off, or exact scorelines — stick to tactical patterns and positioning."
             )
 
         clips = []
@@ -368,7 +435,7 @@ class CoachAI:
     # --- Legacy methods (kept for backward compatibility with analysis pipeline) ---
 
     async def interpret_analysis(self, tactical_analysis: str, coach_context: str = "") -> dict:
-        """Take TwelveLabs analysis and generate coaching advice."""
+        """Take raw tactical analysis (from Gemini) and generate coaching advice."""
         user_message = f"Here is the tactical analysis of the match:\n\n{tactical_analysis}"
         if coach_context:
             user_message += f"\n\nCoach's notes: {coach_context}"

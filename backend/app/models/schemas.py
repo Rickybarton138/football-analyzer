@@ -8,14 +8,16 @@ from enum import Enum
 class MatchStatus(str, Enum):
     uploading = "uploading"
     processing = "processing"
-    indexing = "indexing"
     analysing = "analysing"
     ready = "ready"
     failed = "failed"
+    archived = "archived"
 
 
 class AnalysisType(str, Enum):
     full = "full"
+    our_team = "our_team"
+    opposition = "opposition"
     highlights = "highlights"
     tactical = "tactical"
     player_spotlight = "player_spotlight"

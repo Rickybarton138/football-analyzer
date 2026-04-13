@@ -2,9 +2,10 @@ import { useState, useRef } from 'react';
 import { useParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
-import { Play, Brain, ClipboardList, Loader2, Users, AlertTriangle, Bot, Download, FileText, Target, Shield, Eye } from 'lucide-react';
+import { Play, Brain, ClipboardList, Loader2, Users, AlertTriangle, Bot, Download, FileText, Target, Shield, Eye, PenTool } from 'lucide-react';
 import MuxPlayer from '@mux/mux-player-react';
 import CoachChat from '../components/CoachChat';
+import VideoAnnotator from '../components/VideoAnnotator';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8002/api';
 
@@ -33,7 +34,9 @@ export default function MatchView() {
   const { id } = useParams<{ id: string }>();
   const queryClient = useQueryClient();
   const [chatOpen, setChatOpen] = useState(false);
+  const [annotating, setAnnotating] = useState(false);
   const playerRef = useRef<any>(null);
+  const videoContainerRef = useRef<HTMLDivElement>(null);
 
   const { data: match, isLoading } = useQuery({
     queryKey: ['match', id],
@@ -61,20 +64,49 @@ export default function MatchView() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['analyses', id] }),
   });
 
+  const updateMatch = useMutation({
+    mutationFn: (data: Record<string, string>) => api.updateMatch(id!, data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['match', id] }),
+  });
+
   const sessionPlan = useMutation({
     mutationFn: () => api.generateSessionPlan(id!),
   });
 
+  const clipEndRef = useRef<number | null>(null);
+
   const handleSeekTo = (time: number) => {
+    clipEndRef.current = null; // clear any active clip boundary
     const el = playerRef.current;
     if (el) {
-      // MuxPlayer exposes the media element
       const media = el.media?.nativeEl || el;
       if (media && typeof media.currentTime !== 'undefined') {
         media.currentTime = time;
         media.play?.();
       }
     }
+  };
+
+  const handlePlayClip = (start: number, end: number) => {
+    const el = playerRef.current;
+    if (!el) return;
+    const media = el.media?.nativeEl || el;
+    if (!media || typeof media.currentTime === 'undefined') return;
+
+    media.currentTime = start;
+    clipEndRef.current = end;
+    media.play?.();
+
+    const onTimeUpdate = () => {
+      if (clipEndRef.current !== null && media.currentTime >= clipEndRef.current) {
+        media.pause();
+        clipEndRef.current = null;
+        media.removeEventListener('timeupdate', onTimeUpdate);
+      }
+    };
+    // Remove any previous listener to avoid stacking
+    media.removeEventListener('timeupdate', onTimeUpdate);
+    media.addEventListener('timeupdate', onTimeUpdate);
   };
 
   if (isLoading) {
@@ -95,7 +127,7 @@ export default function MatchView() {
       <div className={`space-y-8 transition-all duration-300 ${chatOpen ? 'mr-[420px]' : ''}`}>
         {/* Video Player */}
         <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
-          <div className="aspect-video bg-black">
+          <div ref={videoContainerRef} className="aspect-video bg-black relative">
             {/* TODO: Generate chapters WebVTT from TwelveLabs timestamps */}
             {m?.mux_playback_id ? (
               <MuxPlayer
@@ -130,6 +162,14 @@ export default function MatchView() {
                 )}
               </div>
             )}
+            {/* Annotation overlay */}
+            <VideoAnnotator
+              containerRef={videoContainerRef}
+              videoRef={playerRef}
+              matchId={id!}
+              isActive={annotating}
+              onClose={() => setAnnotating(false)}
+            />
           </div>
           <div className="p-4 flex items-start justify-between">
             <div>
@@ -139,8 +179,49 @@ export default function MatchView() {
                 {m?.formation && <span>{m.formation}</span>}
                 {m?.duration_seconds && <span>{Math.round(m.duration_seconds / 60)} min</span>}
               </div>
+              {/* Team Kit Colors */}
+              <div className="flex items-center gap-3 mt-2">
+                <div className="flex items-center gap-1.5 text-xs text-zinc-500">
+                  <span>Our kit:</span>
+                  <select
+                    value={m?.team_color || ''}
+                    onChange={(e) => updateMatch.mutate({ team_color: e.target.value })}
+                    className="bg-zinc-800 border border-zinc-700 rounded px-2 py-0.5 text-zinc-300 text-xs"
+                  >
+                    <option value="">Select...</option>
+                    {['yellow', 'blue', 'red', 'white', 'black', 'green', 'orange', 'purple', 'pink', 'grey'].map(c => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex items-center gap-1.5 text-xs text-zinc-500">
+                  <span>Their kit:</span>
+                  <select
+                    value={m?.opponent_color || ''}
+                    onChange={(e) => updateMatch.mutate({ opponent_color: e.target.value })}
+                    className="bg-zinc-800 border border-zinc-700 rounded px-2 py-0.5 text-zinc-300 text-xs"
+                  >
+                    <option value="">Select...</option>
+                    {['yellow', 'blue', 'red', 'white', 'black', 'green', 'orange', 'purple', 'pink', 'grey'].map(c => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
             </div>
             {m?.status === 'ready' && (
+              <div className="flex items-center gap-2">
+              <button
+                onClick={() => { setAnnotating(!annotating); if (!annotating) { /* pause video when entering annotate mode */ const media = playerRef.current?.media?.nativeEl || playerRef.current; media?.pause?.(); } }}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium text-sm transition-colors ${
+                  annotating
+                    ? 'bg-amber-500 text-white'
+                    : 'bg-amber-500/10 border border-amber-500/20 text-amber-400 hover:bg-amber-500/20'
+                }`}
+              >
+                <PenTool className="w-4 h-4" />
+                {annotating ? 'Exit Annotate' : 'Annotate'}
+              </button>
               <button
                 onClick={() => setChatOpen(!chatOpen)}
                 className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium text-sm transition-colors ${
@@ -152,9 +233,23 @@ export default function MatchView() {
                 <Bot className="w-4 h-4" />
                 {chatOpen ? 'Close Coach' : 'Talk to Coach'}
               </button>
+              </div>
             )}
           </div>
         </div>
+
+        {/* Kit colour nag — analyses mislabel teams when colours are unset */}
+        {m?.status === 'ready' && (!m?.team_color || !m?.opponent_color) && (
+          <div className="flex items-start gap-3 bg-amber-500/10 border border-amber-500/30 text-amber-200 px-4 py-3 rounded-lg">
+            <AlertTriangle className="w-5 h-5 flex-shrink-0 mt-0.5 text-amber-400" />
+            <div className="text-sm">
+              <span className="font-semibold">Kit colours not set.</span>{' '}
+              The AI reads the video by kit colour, so reports and chat will mislabel which team is yours.
+              Set <span className="font-medium text-amber-100">Our kit</span> and{' '}
+              <span className="font-medium text-amber-100">Their kit</span> above before running any analyses.
+            </div>
+          </div>
+        )}
 
         {/* Analysis Actions */}
         {m?.status === 'ready' && (
@@ -170,14 +265,22 @@ export default function MatchView() {
                 {(runAnalysis.error as Error).message}
               </div>
             )}
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
               <button
-                onClick={() => runAnalysis.mutate('full')}
+                onClick={() => runAnalysis.mutate('our_team')}
                 disabled={runAnalysis.isPending}
                 className="flex items-center justify-center gap-2 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20 py-3 rounded-lg font-medium transition-colors"
               >
-                <Brain className="w-4 h-4" />
-                Full Analysis
+                <Shield className="w-4 h-4" />
+                Our Team Report
+              </button>
+              <button
+                onClick={() => runAnalysis.mutate('opposition')}
+                disabled={runAnalysis.isPending}
+                className="flex items-center justify-center gap-2 bg-red-500/10 border border-red-500/20 text-red-400 hover:bg-red-500/20 py-3 rounded-lg font-medium transition-colors"
+              >
+                <Eye className="w-4 h-4" />
+                Opposition Report
               </button>
               <button
                 onClick={() => runAnalysis.mutate('highlights')}
@@ -260,43 +363,67 @@ export default function MatchView() {
         )}
 
         {/* Analysis Results */}
-        {latestAnalysis && (
+        {analysisList.filter((a: any) => a.status === 'complete').length > 0 && (
           <div className="space-y-6">
-            {latestAnalysis.coaching_advice && (
-              <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
-                <h2 className="text-lg font-semibold text-emerald-400 mb-3">Coaching Insights</h2>
+            {/* Our Team Report */}
+            {analysisList.filter((a: any) => a.status === 'complete' && a.analysis_type === 'our_team').map((a: any) => (
+              <div key={a.id} className="bg-zinc-900 border border-emerald-500/20 rounded-xl p-6">
+                <h2 className="text-lg font-semibold text-emerald-400 mb-3">Our Team Report</h2>
                 <div className="prose prose-invert prose-sm max-w-none whitespace-pre-wrap">
-                  {latestAnalysis.coaching_advice}
+                  {a.coaching_advice}
                 </div>
               </div>
-            )}
+            ))}
 
-            {latestAnalysis.tactical_raw && (
-              <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
-                <h2 className="text-lg font-semibold text-blue-400 mb-3">Tactical Analysis</h2>
+            {/* Opposition Report */}
+            {analysisList.filter((a: any) => a.status === 'complete' && a.analysis_type === 'opposition').map((a: any) => (
+              <div key={a.id} className="bg-zinc-900 border border-red-500/20 rounded-xl p-6">
+                <h2 className="text-lg font-semibold text-red-400 mb-3">Opposition Scouting Report</h2>
                 <div className="prose prose-invert prose-sm max-w-none whitespace-pre-wrap">
-                  {latestAnalysis.tactical_raw}
+                  {a.highlights_raw}
                 </div>
               </div>
-            )}
+            ))}
 
-            {latestAnalysis.highlights_raw && (
-              <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+            {/* Highlights */}
+            {analysisList.filter((a: any) => a.status === 'complete' && a.analysis_type === 'highlights').map((a: any) => (
+              <div key={a.id} className="bg-zinc-900 border border-amber-500/20 rounded-xl p-6">
                 <h2 className="text-lg font-semibold text-amber-400 mb-3">Key Moments</h2>
                 <div className="prose prose-invert prose-sm max-w-none whitespace-pre-wrap">
-                  {latestAnalysis.highlights_raw}
+                  {a.highlights_raw}
                 </div>
               </div>
-            )}
+            ))}
 
-            {latestAnalysis.player_analysis_raw && (
-              <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+            {/* Tactical */}
+            {analysisList.filter((a: any) => a.status === 'complete' && a.analysis_type === 'tactical').map((a: any) => (
+              <div key={a.id} className="bg-zinc-900 border border-blue-500/20 rounded-xl p-6">
+                <h2 className="text-lg font-semibold text-blue-400 mb-3">Tactical Analysis</h2>
+                <div className="prose prose-invert prose-sm max-w-none whitespace-pre-wrap">
+                  {a.tactical_raw || a.coaching_advice}
+                </div>
+              </div>
+            ))}
+
+            {/* Player Analysis */}
+            {analysisList.filter((a: any) => a.status === 'complete' && a.analysis_type === 'player_spotlight').map((a: any) => (
+              <div key={a.id} className="bg-zinc-900 border border-cyan-500/20 rounded-xl p-6">
                 <h2 className="text-lg font-semibold text-cyan-400 mb-3">Player Analysis</h2>
                 <div className="prose prose-invert prose-sm max-w-none whitespace-pre-wrap">
-                  {latestAnalysis.player_analysis_raw}
+                  {a.player_analysis_raw}
                 </div>
               </div>
-            )}
+            ))}
+
+            {/* Legacy full analysis (from pipeline) */}
+            {analysisList.filter((a: any) => a.status === 'complete' && a.analysis_type === 'full' && a.coaching_advice).map((a: any) => (
+              <div key={a.id} className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+                <h2 className="text-lg font-semibold text-emerald-400 mb-3">Match Analysis</h2>
+                <div className="prose prose-invert prose-sm max-w-none whitespace-pre-wrap">
+                  {a.coaching_advice}
+                </div>
+              </div>
+            ))}
           </div>
         )}
 
@@ -317,6 +444,7 @@ export default function MatchView() {
         isOpen={chatOpen}
         onClose={() => setChatOpen(false)}
         onSeekTo={handleSeekTo}
+        onPlayClip={handlePlayClip}
       />
     </>
   );

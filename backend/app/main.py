@@ -1,5 +1,25 @@
 """Manager Mentor v2 — FastAPI Application"""
 
+import sys
+import asyncio
+import logging
+
+# Windows + Python 3.14 defaults to SelectorEventLoop which cannot spawn
+# subprocesses (ffprobe/ffmpeg). Force the Proactor policy before any loop
+# is created so the video pipeline can run.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+# Route app loggers (app.api.matches, app.services.gemini_service, etc.) to
+# stdout at INFO level so background-task progress is visible in uvicorn's log.
+# Without this the root logger has no handler and every logger.info() is dropped.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
